@@ -11,6 +11,15 @@ class ModelConfig:
     tokenizer_name_or_path: str
     adaptation_method: str = "full"
     target_modules: tuple[str, ...] = ("query", "value")
+    adapt_layers: tuple[int, ...] | None = None
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    ttlora_rank: int = 5
+    ttlora_alpha: float = 8.0
+    ttlora_variant: str = "contraction"
+    ttlora_shape: tuple[int, ...] = (64, 4, 3, 3, 4, 64)
+    ttlora_input_factors: tuple[int, ...] = (64, 4, 3)
+    ttlora_output_factors: tuple[int, ...] = (64, 4, 3)
 
 
 @dataclass(slots=True)
@@ -31,11 +40,13 @@ class DataConfig:
 class TrainingConfig:
     output_dir: str = "runs"
     run_name: str = "phase1"
+    overwrite_run_dir: bool = False
     batch_size: int = 16
     eval_batch_size: int = 32
     gradient_accumulation_steps: int = 1
     epochs: int = 5
-    learning_rate: float = 2e-5
+    learning_rate: float = 2e-5  # Interpreted as base/peak LR depending on scheduler choice.
+    lr_scheduler: str = "none"
     weight_decay: float = 0.01
     warmup_ratio: float = 0.06
     max_grad_norm: float = 1.0
@@ -44,6 +55,7 @@ class TrainingConfig:
     patience: int = 3
     device: str = "auto"
     log_every_steps: int = 20
+    step_metrics_every: int = 1
 
 
 @dataclass(slots=True)

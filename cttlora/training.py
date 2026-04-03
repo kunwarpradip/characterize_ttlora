@@ -7,14 +7,24 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-
 import torch
 from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
+from transformers import (
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
 
 from .config import ExperimentConfig
 from .data import prepare_phase1_data
-from .modeling import count_parameters, load_sequence_classification_model, parameter_groups, trainable_parameter_names
+from .modeling import (
+    classifier_state_dict,
+    classifier_state_summary,
+    count_parameters,
+    load_sequence_classification_model,
+    parameter_groups,
+    trainable_parameter_names,
+)
 from .tasks import get_task_spec
 
 
@@ -26,9 +36,31 @@ class EpochRecord:
     validation_loss: float
     validation_accuracy: float
     avg_grad_norm: float
+    max_grad_norm: float
+    min_grad_norm: float
+    clipped_step_fraction: float
+    clipped_steps: int
     learning_rate: float
     epoch_seconds: float
     peak_memory_gb: float
+    validation_improved: bool
+    best_validation_accuracy_so_far: float
+    epochs_since_improvement: int
+
+
+@dataclass(slots=True)
+class StepRecord:
+    epoch: int
+    optimizer_step: int
+    optimizer_step_in_epoch: int
+    micro_step_end: int
+    train_loss: float
+    train_accuracy: float
+    grad_norm_pre_clip: float
+    clipping_triggered: bool
+    learning_rate: float
+    examples_seen_epoch: int
+    elapsed_seconds: float
 
 
 def seed_everything(seed: int) -> None:
@@ -87,16 +119,89 @@ def _write_history_csv(path: Path, records: list[EpochRecord]) -> None:
             writer.writerow(asdict(record))
 
 
+def _write_step_history_csv(path: Path, records: list[StepRecord]) -> None:
+    fieldnames = list(asdict(records[0]).keys()) if records else []
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(asdict(record))
+
+
 def _save_json(path: Path, payload: dict) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
+def prepare_run_dir(base_run_dir: Path, overwrite: bool) -> Path:
+    if overwrite:
+        base_run_dir.mkdir(parents=True, exist_ok=True)
+        return base_run_dir
+
+    if not base_run_dir.exists() or not any(base_run_dir.iterdir()):
+        base_run_dir.mkdir(parents=True, exist_ok=True)
+        return base_run_dir
+
+    version = 1
+    while True:
+        candidate = base_run_dir.parent / f"{base_run_dir.name}_v{version}"
+        if not candidate.exists() or not any(candidate.iterdir()):
+            candidate.mkdir(parents=True, exist_ok=True)
+            print(f"Run directory exists; using versioned run directory: {candidate}")
+            return candidate
+        version += 1
+
+
+def save_classifier_init_artifacts(run_dir: Path, model) -> dict:
+    classifier_dir = run_dir / "artifacts"
+    classifier_dir.mkdir(parents=True, exist_ok=True)
+    state = classifier_state_dict(model)
+    summary = classifier_state_summary(model)
+
+    state_path = classifier_dir / "classifier_init.pt"
+    summary_path = classifier_dir / "classifier_init_summary.json"
+
+    torch.save(state, state_path)
+    _save_json(summary_path, summary)
+
+    return {
+        "classifier_init_path": str(state_path),
+        "classifier_init_summary_path": str(summary_path),
+        "classifier_init_sha256": summary["global_sha256"],
+        "classifier_parameter_count": summary["parameter_count"],
+    }
+
+
+def build_scheduler(optimizer: AdamW, config: ExperimentConfig, total_steps: int):
+    scheduler_name = config.training.lr_scheduler
+    if scheduler_name == "none":
+        return None
+    warmup_steps = int(total_steps * config.training.warmup_ratio)
+    if scheduler_name == "linear_with_warmup":
+        return get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+    if scheduler_name == "cosine_with_warmup":
+        return get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+    if scheduler_name == "constant_with_warmup":
+        return get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+        )
+    raise ValueError(f"Unsupported lr_scheduler: {scheduler_name}")
+
+
 def run_phase1_experiment(config: ExperimentConfig) -> dict:
     seed_everything(config.training.seed)
-    run_dir = config.run_dir()
+    base_run_dir = config.run_dir()
+    run_dir = prepare_run_dir(base_run_dir, config.training.overwrite_run_dir)
     checkpoints_dir = run_dir / "checkpoints" / "best"
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     task_spec = get_task_spec(
         config.data.dataset_name,
@@ -113,6 +218,7 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
     )
 
     model = load_sequence_classification_model(config.model, task_spec.num_labels)
+    classifier_init_info = save_classifier_init_artifacts(run_dir, model)
     parameter_stats = count_parameters(model)
     trainable_names = trainable_parameter_names(model)
     device = resolve_device(config.training.device)
@@ -128,17 +234,16 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
     )
     steps_per_epoch = math.ceil(len(train_loader) / max(1, config.training.gradient_accumulation_steps))
     total_steps = max(1, steps_per_epoch * config.training.epochs)
-    warmup_steps = int(total_steps * config.training.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
+    scheduler = build_scheduler(optimizer, config, total_steps)
 
     best_val_accuracy = float("-inf")
     best_epoch = 0
+    last_improvement_epoch = 0
+    validation_improvement_events = 0
     stale_epochs = 0
     history: list[EpochRecord] = []
+    step_history: list[StepRecord] = []
+    global_optimizer_step = 0
 
     _save_json(run_dir / "config.json", config.to_dict())
 
@@ -151,7 +256,13 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
         running_correct = 0
         running_examples = 0
         grad_norm_sum = 0.0
+        grad_norm_max = 0.0
+        grad_norm_min = float("inf")
+        clipped_steps = 0
         optimizer_steps = 0
+        micro_loss_sum = 0.0
+        micro_correct = 0
+        micro_examples = 0
 
         for step, batch in enumerate(train_loader, start=1):
             batch = {key: value.to(device) for key, value in batch.items()}
@@ -162,6 +273,9 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
             running_loss += outputs.loss.item() * batch["labels"].size(0)
             running_correct += (outputs.logits.argmax(dim=-1) == batch["labels"]).sum().item()
             running_examples += batch["labels"].size(0)
+            micro_loss_sum += outputs.loss.item() * batch["labels"].size(0)
+            micro_correct += (outputs.logits.argmax(dim=-1) == batch["labels"]).sum().item()
+            micro_examples += batch["labels"].size(0)
 
             should_step = (
                 step % config.training.gradient_accumulation_steps == 0
@@ -169,12 +283,42 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
             )
             if should_step:
                 grad_norm = compute_grad_norm(model)
+                grad_norm_max = max(grad_norm_max, grad_norm)
+                grad_norm_min = min(grad_norm_min, grad_norm)
+                clipping_triggered = grad_norm > config.training.max_grad_norm
+                if clipping_triggered:
+                    clipped_steps += 1
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
                 optimizer.step()
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 grad_norm_sum += grad_norm
                 optimizer_steps += 1
+                global_optimizer_step += 1
+                current_lr = (
+                    scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+                )
+
+                if optimizer_steps % max(1, config.training.step_metrics_every) == 0:
+                    step_history.append(
+                        StepRecord(
+                            epoch=epoch,
+                            optimizer_step=global_optimizer_step,
+                            optimizer_step_in_epoch=optimizer_steps,
+                            micro_step_end=step,
+                            train_loss=micro_loss_sum / max(1, micro_examples),
+                            train_accuracy=micro_correct / max(1, micro_examples),
+                            grad_norm_pre_clip=grad_norm,
+                            clipping_triggered=clipping_triggered,
+                            learning_rate=current_lr,
+                            examples_seen_epoch=running_examples,
+                            elapsed_seconds=time.time() - start_time,
+                        )
+                    )
+                micro_loss_sum = 0.0
+                micro_correct = 0
+                micro_examples = 0
 
                 if optimizer_steps % max(1, config.training.log_every_steps) == 0:
                     avg_loss = running_loss / max(1, running_examples)
@@ -182,7 +326,7 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
                     print(
                         f"epoch={epoch} step={optimizer_steps}/{steps_per_epoch} "
                         f"train_loss={avg_loss:.4f} train_acc={avg_acc:.4f} "
-                        f"grad_norm={grad_norm:.4f} lr={scheduler.get_last_lr()[0]:.2e}"
+                        f"grad_norm={grad_norm:.4f} clipped={clipping_triggered} lr={current_lr:.2e}"
                     )
 
         train_loss = running_loss / max(1, running_examples)
@@ -193,7 +337,8 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
             torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == "cuda" else 0.0
         )
         avg_grad_norm = grad_norm_sum / max(1, optimizer_steps)
-        learning_rate = scheduler.get_last_lr()[0]
+        learning_rate = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+        validation_improved = val_accuracy > best_val_accuracy
 
         record = EpochRecord(
             epoch=epoch,
@@ -202,9 +347,16 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
             validation_loss=val_loss,
             validation_accuracy=val_accuracy,
             avg_grad_norm=avg_grad_norm,
+            max_grad_norm=grad_norm_max,
+            min_grad_norm=0.0 if grad_norm_min == float("inf") else grad_norm_min,
+            clipped_step_fraction=clipped_steps / max(1, optimizer_steps),
+            clipped_steps=clipped_steps,
             learning_rate=learning_rate,
             epoch_seconds=epoch_seconds,
             peak_memory_gb=peak_memory_gb,
+            validation_improved=validation_improved,
+            best_validation_accuracy_so_far=max(best_val_accuracy, val_accuracy),
+            epochs_since_improvement=0 if validation_improved else stale_epochs + 1,
         )
         history.append(record)
 
@@ -215,9 +367,11 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
             f"peak_mem_gb={peak_memory_gb:.2f}"
         )
 
-        if val_accuracy > best_val_accuracy:
+        if validation_improved:
             best_val_accuracy = val_accuracy
             best_epoch = epoch
+            last_improvement_epoch = epoch
+            validation_improvement_events += 1
             stale_epochs = 0
             checkpoints_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(checkpoints_dir)
@@ -232,18 +386,40 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
                 break
 
     history_path = run_dir / "history.csv"
+    step_history_path = run_dir / "step_history.csv"
     _write_history_csv(history_path, history)
+    _write_step_history_csv(step_history_path, step_history)
+
+    first_epoch = history[0] if history else None
+    initial_validation_accuracy = first_epoch.validation_accuracy if first_epoch else None
+    initial_validation_loss = first_epoch.validation_loss if first_epoch else None
+    first_validation_improvement_epoch = None
+    for record in history:
+        if record.validation_improved:
+            first_validation_improvement_epoch = record.epoch
+            break
 
     summary = {
         "dataset_name": config.data.dataset_name,
+        "base_run_dir": str(base_run_dir),
+        "resolved_run_dir": str(run_dir),
         "train_examples": len(train_dataset),
         "validation_examples": len(val_dataset),
         "model_name_or_path": config.model.model_name_or_path,
         "adaptation_method": config.model.adaptation_method,
+        "ttlora_variant": config.model.ttlora_variant if config.model.adaptation_method == "ttlora" else None,
         "target_modules": list(config.model.target_modules),
+        "seed": config.training.seed,
+        "lr_scheduler": config.training.lr_scheduler,
         "best_epoch": best_epoch,
         "epochs_ran": len(history),
         "epochs_to_best": best_epoch,
+        "last_improvement_epoch": last_improvement_epoch,
+        "epochs_since_last_improvement": (len(history) - last_improvement_epoch) if history and last_improvement_epoch else None,
+        "validation_improvement_events": validation_improvement_events,
+        "first_validation_improvement_epoch": first_validation_improvement_epoch,
+        "initial_validation_accuracy": initial_validation_accuracy,
+        "initial_validation_loss": initial_validation_loss,
         "best_validation_accuracy": best_val_accuracy,
         "final_validation_accuracy": history[-1].validation_accuracy if history else None,
         "final_validation_loss": history[-1].validation_loss if history else None,
@@ -254,9 +430,18 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
         "avg_grad_norm": (
             sum(record.avg_grad_norm for record in history) / len(history) if history else 0.0
         ),
+        "max_grad_norm": max((record.max_grad_norm for record in history), default=0.0),
+        "min_grad_norm": min((record.min_grad_norm for record in history), default=0.0),
+        "avg_clipped_step_fraction": (
+            sum(record.clipped_step_fraction for record in history) / len(history) if history else 0.0
+        ),
+        "total_clipped_steps": sum(record.clipped_steps for record in history),
+        "step_metrics_logged": len(step_history),
         "history_path": str(history_path),
+        "step_history_path": str(step_history_path),
         "best_checkpoint_dir": str(checkpoints_dir),
         "trainable_parameter_names": trainable_names,
+        **classifier_init_info,
         **parameter_stats,
         **config.metadata,
     }
