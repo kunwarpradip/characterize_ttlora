@@ -41,6 +41,7 @@ class TrainingConfig:
     output_dir: str = "runs"
     run_name: str = "phase1"
     overwrite_run_dir: bool = False
+    summary_only: bool = False
     batch_size: int = 16
     eval_batch_size: int = 32
     gradient_accumulation_steps: int = 1

@@ -10,3 +10,9 @@ roberta-base/
 # datasets/
 plots/
 suites/
+phases/ttlora_variant_comparison/runs/*
+!phases/ttlora_variant_comparison/runs/.gitkeep
+phases/ttlora_variant_comparison/suites/*
+!phases/ttlora_variant_comparison/suites/.gitkeep
+phases/ttlora_variant_comparison/analysis/*
+!phases/ttlora_variant_comparison/analysis/.gitkeep

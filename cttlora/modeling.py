@@ -8,8 +8,7 @@ from transformers import AutoModelForSequenceClassification
 
 from .adapters import (
     LoRALinearWrapper,
-    TTLoRALinearWrapperContraction,
-    TTLoRALinearWrapperReconstruction,
+    TTLoRALinearWrapper,
     freeze_model_parameters,
 )
 from .config import ModelConfig
@@ -147,24 +146,20 @@ def apply_ttlora(model, model_config: ModelConfig):
     return _wrap_roberta_layers(
         model,
         model_config,
-        wrapper_factory=lambda original: (
-            TTLoRALinearWrapperContraction(
-                original_layer=original,
-                tt_shape=model_config.ttlora_shape,
-                rank=model_config.ttlora_rank,
-                alpha=model_config.ttlora_alpha,
-                input_factors=model_config.ttlora_input_factors,
-                output_factors=model_config.ttlora_output_factors,
-            )
-            if variant == "contraction"
-            else TTLoRALinearWrapperReconstruction(
-                original_layer=original,
-                tt_shape=model_config.ttlora_shape,
-                rank=model_config.ttlora_rank,
-                alpha=model_config.ttlora_alpha,
-            )
+        wrapper_factory=lambda original: TTLoRALinearWrapper(
+            original_layer=original,
+            tt_shape=model_config.ttlora_shape,
+            rank=model_config.ttlora_rank,
+            alpha=model_config.ttlora_alpha,
+            mode=variant,
+            input_factors=model_config.ttlora_input_factors,
+            output_factors=model_config.ttlora_output_factors,
         ),
     )
+
+
+def named_ttlora_modules(model) -> list[tuple[str, TTLoRALinearWrapper]]:
+    return [(name, module) for name, module in model.named_modules() if isinstance(module, TTLoRALinearWrapper)]
 
 
 def count_parameters(model) -> dict[str, int]:

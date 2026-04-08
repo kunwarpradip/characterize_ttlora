@@ -218,9 +218,11 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
     )
 
     model = load_sequence_classification_model(config.model, task_spec.num_labels)
-    classifier_init_info = save_classifier_init_artifacts(run_dir, model)
+    classifier_init_info = (
+        save_classifier_init_artifacts(run_dir, model) if not config.training.summary_only else {}
+    )
     parameter_stats = count_parameters(model)
-    trainable_names = trainable_parameter_names(model)
+    trainable_names = [] if config.training.summary_only else trainable_parameter_names(model)
     device = resolve_device(config.training.device)
     model.to(device)
 
@@ -245,7 +247,8 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
     step_history: list[StepRecord] = []
     global_optimizer_step = 0
 
-    _save_json(run_dir / "config.json", config.to_dict())
+    if not config.training.summary_only:
+        _save_json(run_dir / "config.json", config.to_dict())
 
     for epoch in range(1, config.training.epochs + 1):
         model.train()
@@ -373,9 +376,10 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
             last_improvement_epoch = epoch
             validation_improvement_events += 1
             stale_epochs = 0
-            checkpoints_dir.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(checkpoints_dir)
-            tokenizer.save_pretrained(checkpoints_dir)
+            if not config.training.summary_only:
+                checkpoints_dir.mkdir(parents=True, exist_ok=True)
+                model.save_pretrained(checkpoints_dir)
+                tokenizer.save_pretrained(checkpoints_dir)
         else:
             stale_epochs += 1
             if stale_epochs >= config.training.patience:
@@ -387,8 +391,9 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
 
     history_path = run_dir / "history.csv"
     step_history_path = run_dir / "step_history.csv"
-    _write_history_csv(history_path, history)
-    _write_step_history_csv(step_history_path, step_history)
+    if not config.training.summary_only:
+        _write_history_csv(history_path, history)
+        _write_step_history_csv(step_history_path, step_history)
 
     first_epoch = history[0] if history else None
     initial_validation_accuracy = first_epoch.validation_accuracy if first_epoch else None
@@ -410,7 +415,23 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
         "ttlora_variant": config.model.ttlora_variant if config.model.adaptation_method == "ttlora" else None,
         "target_modules": list(config.model.target_modules),
         "seed": config.training.seed,
+        "learning_rate": config.training.learning_rate,
         "lr_scheduler": config.training.lr_scheduler,
+        "batch_size": config.training.batch_size,
+        "eval_batch_size": config.training.eval_batch_size,
+        "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "max_grad_norm_threshold": config.training.max_grad_norm,
+        "num_workers": config.training.num_workers,
+        "summary_only": config.training.summary_only,
+        "ttlora_rank": config.model.ttlora_rank if config.model.adaptation_method == "ttlora" else None,
+        "ttlora_alpha": config.model.ttlora_alpha if config.model.adaptation_method == "ttlora" else None,
+        "ttlora_shape": list(config.model.ttlora_shape) if config.model.adaptation_method == "ttlora" else None,
+        "ttlora_input_factors": list(config.model.ttlora_input_factors)
+        if config.model.adaptation_method == "ttlora"
+        else None,
+        "ttlora_output_factors": list(config.model.ttlora_output_factors)
+        if config.model.adaptation_method == "ttlora"
+        else None,
         "best_epoch": best_epoch,
         "epochs_ran": len(history),
         "epochs_to_best": best_epoch,
@@ -437,9 +458,9 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
         ),
         "total_clipped_steps": sum(record.clipped_steps for record in history),
         "step_metrics_logged": len(step_history),
-        "history_path": str(history_path),
-        "step_history_path": str(step_history_path),
-        "best_checkpoint_dir": str(checkpoints_dir),
+        "history_path": str(history_path) if not config.training.summary_only else None,
+        "step_history_path": str(step_history_path) if not config.training.summary_only else None,
+        "best_checkpoint_dir": str(checkpoints_dir) if not config.training.summary_only else None,
         "trainable_parameter_names": trainable_names,
         **classifier_init_info,
         **parameter_stats,

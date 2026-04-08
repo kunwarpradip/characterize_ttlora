@@ -24,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow overwriting an existing run directory.",
     )
+    parser.add_argument(
+        "--summary-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save only summary.json for the run and skip checkpoints/history/config artifacts.",
+    )
     parser.add_argument("--max-length", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--eval-batch-size", type=int, default=32)
@@ -157,6 +163,7 @@ def main() -> None:
             output_dir=args.output_dir,
             run_name=run_name,
             overwrite_run_dir=args.overwrite_run_dir,
+            summary_only=args.summary_only,
             batch_size=args.batch_size,
             eval_batch_size=args.eval_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,

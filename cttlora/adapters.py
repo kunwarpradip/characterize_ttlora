@@ -136,32 +136,147 @@ def reconstruct_tt_tensor(tt_cores: nn.ParameterList) -> torch.Tensor:
     return result.squeeze(0).squeeze(-1)
 
 
-class TTLoRALinearWrapperReconstruction(nn.Module):
+def reconstruct_tt_weight_matrix(
+    tt_cores: nn.ParameterList,
+    input_factors: tuple[int, ...],
+    output_factors: tuple[int, ...],
+) -> torch.Tensor:
+    """Return the dense [out_features, in_features] matrix equivalent to contraction mode."""
+    tt_tensor = reconstruct_tt_tensor(tt_cores)
+    num_input_dims = len(input_factors)
+    input_axes = list(range(num_input_dims))
+    output_axes = list(range(num_input_dims, num_input_dims + len(output_factors)))
+    permuted = tt_tensor.permute(*output_axes, *reversed(input_axes))
+    return permuted.reshape(math.prod(output_factors), math.prod(input_factors))
+
+
+class TTLoRALinearWrapper(nn.Module):
     def __init__(
         self,
         original_layer: nn.Linear,
         tt_shape: tuple[int, ...],
         rank: int,
         alpha: float,
+        mode: str,
+        input_factors: tuple[int, ...],
+        output_factors: tuple[int, ...],
     ) -> None:
         super().__init__()
         if not isinstance(original_layer, nn.Linear):
             raise TypeError(f"TT-LoRA wrapper currently supports nn.Linear only, got {type(original_layer)}")
+        if mode not in {"contraction", "reconstruction"}:
+            raise ValueError(f"Unsupported TT-LoRA mode '{mode}'. Expected 'contraction' or 'reconstruction'.")
 
         self.original = original_layer
         self.tt_shape = tt_shape
         self.tt_rank = ttlora_rank_list(rank, tt_shape)
         self.alpha = alpha
+        self.mode = mode
+        self.input_factors = input_factors
+        self.output_factors = output_factors
 
-        weight_rows, weight_cols = original_layer.weight.shape
-        if math.prod(tt_shape) != weight_rows * weight_cols:
+        if math.prod(input_factors) != original_layer.in_features:
+            raise ValueError(
+                f"Input TT factors {input_factors} multiply to {math.prod(input_factors)}, "
+                f"but layer in_features is {original_layer.in_features}."
+            )
+        if math.prod(output_factors) != original_layer.out_features:
+            raise ValueError(
+                f"Output TT factors {output_factors} multiply to {math.prod(output_factors)}, "
+                f"but layer out_features is {original_layer.out_features}."
+            )
+        if len(tt_shape) != len(input_factors) + len(output_factors):
+            raise ValueError("TT shape length must equal len(input_factors) + len(output_factors).")
+        if tuple(tt_shape[: len(input_factors)]) != input_factors:
+            raise ValueError(
+                f"TT shape input prefix {tt_shape[: len(input_factors)]} does not match input_factors {input_factors}."
+            )
+        if tuple(tt_shape[len(input_factors) :]) != output_factors[::-1]:
+            raise ValueError(
+                "TT shape output suffix must equal reversed output_factors so contraction and reconstruction "
+                "represent the same linear operator."
+            )
+        if math.prod(tt_shape) != original_layer.in_features * original_layer.out_features:
             raise ValueError(
                 f"TT shape {tt_shape} multiplies to {math.prod(tt_shape)}, "
-                f"but layer matrix size is {weight_rows * weight_cols}."
+                f"but layer matrix size is {original_layer.in_features * original_layer.out_features}."
             )
         self.tt_cores = generate_tt_cores(self.tt_shape, self.tt_rank)
 
+    def _reshape_input(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+        if x.shape[-1] != self.original.in_features:
+            raise ValueError(
+                f"Expected last dimension {self.original.in_features}, got {x.shape[-1]} for TT-LoRA input."
+            )
+        leading_shape = x.shape[:-1]
+        if x.ndim == 2:
+            return x.unsqueeze(1), leading_shape
+        if x.ndim >= 3:
+            flat = x.reshape(-1, x.shape[-2], x.shape[-1])
+            return flat, leading_shape
+        raise ValueError(f"TT-LoRA wrapper expects input with ndim >= 2, got shape {tuple(x.shape)}.")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        tt_weights = reconstruct_tt_tensor(self.tt_cores)
-        adapted_weight = self.original.weight + self.alpha * tt_weights.reshape_as(self.original.weight)
+        if self.mode == "contraction":
+            x_reshaped, leading_shape = self._reshape_input(x)
+            update = tensorized_multiplication(
+                x=x_reshaped,
+                tt_cores=self.tt_cores,
+                input_factors=self.input_factors,
+                output_factors=self.output_factors,
+            )
+            if x.ndim == 2:
+                update = update.squeeze(1)
+            else:
+                update = update.reshape(*leading_shape, self.original.out_features)
+            return self.original(x) + update * self.alpha
+
+        dense_update_weight = reconstruct_tt_weight_matrix(
+            tt_cores=self.tt_cores,
+            input_factors=self.input_factors,
+            output_factors=self.output_factors,
+        )
+        adapted_weight = self.original.weight + self.alpha * dense_update_weight
         return F.linear(x, adapted_weight, self.original.bias)
+
+
+class TTLoRALinearWrapperContraction(TTLoRALinearWrapper):
+    def __init__(
+        self,
+        original_layer: nn.Linear,
+        tt_shape: tuple[int, ...],
+        rank: int,
+        alpha: float,
+        input_factors: tuple[int, ...],
+        output_factors: tuple[int, ...],
+    ) -> None:
+        super().__init__(
+            original_layer=original_layer,
+            tt_shape=tt_shape,
+            rank=rank,
+            alpha=alpha,
+            mode="contraction",
+            input_factors=input_factors,
+            output_factors=output_factors,
+        )
+
+
+class TTLoRALinearWrapperReconstruction(TTLoRALinearWrapper):
+    def __init__(
+        self,
+        original_layer: nn.Linear,
+        tt_shape: tuple[int, ...],
+        rank: int,
+        alpha: float,
+        input_factors: tuple[int, ...],
+        output_factors: tuple[int, ...],
+    ) -> None:
+        super().__init__(
+            original_layer=original_layer,
+            tt_shape=tt_shape,
+            rank=rank,
+            alpha=alpha,
+            mode="reconstruction",
+            input_factors=input_factors,
+            output_factors=output_factors,
+        )
