@@ -26,7 +26,7 @@ class ModelConfig:
 class DataConfig:
     dataset_name: str
     dataset_root: str
-    max_length: int = 256 #token truncation length
+    max_length: int = 512 #token truncation length
     train_split: str = "train"
     validation_split: str = "validation"
     label_column: str = "label"

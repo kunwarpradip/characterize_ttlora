@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Save only summary.json for the run and skip checkpoints/history/config artifacts.",
     )
-    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--eval-batch-size", type=int, default=32)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=None,
+        help="Convenience override for selecting a specific CUDA device, e.g. --gpu-id 1 -> cuda:1.",
+    )
     parser.add_argument("--log-every-steps", type=int, default=20)
     parser.add_argument(
         "--step-metrics-every",
@@ -124,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    resolved_device = f"cuda:{args.gpu_id}" if args.gpu_id is not None else args.device
 
     model_path = args.model_path
     tokenizer_path = args.tokenizer_path or model_path
@@ -176,7 +183,7 @@ def main() -> None:
             num_workers=args.num_workers,
             seed=args.seed,
             patience=args.patience,
-            device=args.device,
+            device=resolved_device,
             log_every_steps=args.log_every_steps,
             step_metrics_every=args.step_metrics_every,
         ),

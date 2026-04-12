@@ -23,14 +23,25 @@ class SequenceClassificationCollator:
 
 
 def load_local_dataset(data_config: DataConfig) -> DatasetDict:
-    dataset_dir = Path(data_config.dataset_root).expanduser() / data_config.dataset_name
+    dataset_name = data_config.dataset_name
+    dataset_dir = Path(data_config.dataset_root).expanduser() / dataset_name
+    if not dataset_dir.exists() and dataset_name == "winogrande":
+        dataset_dir = Path(data_config.dataset_root).expanduser() / "winogrande_l"
     if not dataset_dir.exists():
         raise FileNotFoundError(
             f"Dataset directory not found: {dataset_dir}. "
             "Update --dataset-root or --dataset-name to match the local stack_v2 layout."
         )
-    dataset = load_dataset(str(dataset_dir))
-    return normalize_dataset(data_config.dataset_name, dataset)
+    parquet_splits = {
+        split: str(dataset_dir / f"{split}.parquet")
+        for split in ("train", "validation", "test")
+        if (dataset_dir / f"{split}.parquet").exists()
+    }
+    if parquet_splits:
+        dataset = load_dataset("parquet", data_files=parquet_splits)
+    else:
+        dataset = load_dataset(str(dataset_dir))
+    return normalize_dataset(dataset_name, dataset)
 
 
 def _select_subset(dataset: Dataset, limit: int | None) -> Dataset:

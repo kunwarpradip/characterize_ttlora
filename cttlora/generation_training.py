@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import csv
+import json
+import math
+import random
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+from torch.optim import AdamW
+from transformers import (
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
+
+from .generation_config import GenerationExperimentConfig
+from .generation_data import prepare_generation_data
+from .generation_modeling import load_generation_model
+from .modeling import count_parameters, parameter_groups, trainable_parameter_names
+from .training import compute_grad_norm, prepare_run_dir, resolve_device
+
+
+@dataclass(slots=True)
+class GenerationEpochRecord:
+    epoch: int
+    train_loss: float
+    train_token_accuracy: float
+    validation_loss: float
+    validation_perplexity: float
+    validation_token_accuracy: float
+    avg_grad_norm: float
+    max_grad_norm: float
+    min_grad_norm: float
+    clipped_step_fraction: float
+    clipped_steps: int
+    learning_rate: float
+    epoch_seconds: float
+    peak_memory_gb: float
+    validation_improved: bool
+    best_validation_loss_so_far: float
+    epochs_since_improvement: int
+
+
+@dataclass(slots=True)
+class GenerationStepRecord:
+    epoch: int
+    optimizer_step: int
+    optimizer_step_in_epoch: int
+    micro_step_end: int
+    train_loss: float
+    train_token_accuracy: float
+    grad_norm_pre_clip: float
+    clipping_triggered: bool
+    learning_rate: float
+    examples_seen_epoch: int
+    elapsed_seconds: float
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except Exception:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _write_history_csv(path: Path, records: list[GenerationEpochRecord]) -> None:
+    fieldnames = list(asdict(records[0]).keys()) if records else []
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(asdict(record))
+
+
+def _write_step_history_csv(path: Path, records: list[GenerationStepRecord]) -> None:
+    fieldnames = list(asdict(records[0]).keys()) if records else []
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(asdict(record))
+
+
+def _save_json(path: Path, payload: dict) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def _safe_perplexity(loss_value: float) -> float:
+    return float(math.exp(min(loss_value, 20.0)))
+
+
+def causal_lm_accuracy_counts(logits: torch.Tensor, labels: torch.Tensor) -> tuple[int, int]:
+    shifted_logits = logits[..., :-1, :]
+    shifted_labels = labels[..., 1:]
+    predictions = shifted_logits.argmax(dim=-1)
+    valid_mask = shifted_labels != -100
+    correct = ((predictions == shifted_labels) & valid_mask).sum().item()
+    total = valid_mask.sum().item()
+    return int(correct), int(total)
+
+
+def build_scheduler(optimizer: AdamW, config: GenerationExperimentConfig, total_steps: int):
+    scheduler_name = config.training.lr_scheduler
+    if scheduler_name == "none":
+        return None
+    warmup_steps = int(total_steps * config.training.warmup_ratio)
+    if scheduler_name == "linear_with_warmup":
+        return get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+    if scheduler_name == "cosine_with_warmup":
+        return get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+    if scheduler_name == "constant_with_warmup":
+        return get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+        )
+    raise ValueError(f"Unsupported lr_scheduler: {scheduler_name}")
+
+
+def evaluate_generation(model, dataloader, device: torch.device) -> tuple[float, float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_examples = 0
+    total_correct_tokens = 0
+    total_tokens = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            outputs = model(**batch)
+            batch_size = batch["input_ids"].size(0)
+            total_loss += outputs.loss.item() * batch_size
+            total_examples += batch_size
+            correct_tokens, token_total = causal_lm_accuracy_counts(outputs.logits, batch["labels"])
+            total_correct_tokens += correct_tokens
+            total_tokens += token_total
+    loss = total_loss / max(1, total_examples)
+    token_accuracy = total_correct_tokens / max(1, total_tokens)
+    return loss, _safe_perplexity(loss), token_accuracy
+
+
+def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
+    seed_everything(config.training.seed)
+    base_run_dir = config.run_dir()
+    run_dir = prepare_run_dir(base_run_dir, config.training.overwrite_run_dir)
+    checkpoints_dir = run_dir / "checkpoints" / "best"
+
+    tokenizer, train_dataset, val_dataset, train_loader, val_loader = prepare_generation_data(
+        data_config=config.data,
+        tokenizer_name_or_path=config.model.tokenizer_name_or_path,
+        batch_size=config.training.batch_size,
+        eval_batch_size=config.training.eval_batch_size,
+        num_workers=config.training.num_workers,
+    )
+    model = load_generation_model(config.model)
+    parameter_stats = count_parameters(model)
+
+    trainable_names = [] if config.training.summary_only else trainable_parameter_names(model)
+    device = resolve_device(config.training.device)
+    model.to(device)
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+
+    optimizer = AdamW(
+        parameter_groups(model, config.training.weight_decay),
+        lr=config.training.learning_rate,
+    )
+    steps_per_epoch = math.ceil(len(train_loader) / max(1, config.training.gradient_accumulation_steps))
+    total_steps = max(1, steps_per_epoch * config.training.epochs)
+    scheduler = build_scheduler(optimizer, config, total_steps)
+
+    best_val_loss = float("inf")
+    best_epoch = 0
+    last_improvement_epoch = 0
+    stale_epochs = 0
+    history: list[GenerationEpochRecord] = []
+    step_history: list[GenerationStepRecord] = []
+    global_optimizer_step = 0
+
+    if not config.training.summary_only:
+        _save_json(run_dir / "config.json", config.to_dict())
+
+    for epoch in range(1, config.training.epochs + 1):
+        model.train()
+        start_time = time.time()
+        optimizer.zero_grad(set_to_none=True)
+
+        running_loss = 0.0
+        running_examples = 0
+        running_token_correct = 0
+        running_token_total = 0
+        grad_norm_sum = 0.0
+        grad_norm_max = 0.0
+        grad_norm_min = float("inf")
+        clipped_steps = 0
+        optimizer_steps = 0
+        micro_loss_sum = 0.0
+        micro_examples = 0
+        micro_token_correct = 0
+        micro_token_total = 0
+
+        for step, batch in enumerate(train_loader, start=1):
+            batch = {key: value.to(device) for key, value in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss / max(1, config.training.gradient_accumulation_steps)
+            loss.backward()
+
+            batch_size = batch["input_ids"].size(0)
+            correct_tokens, token_total = causal_lm_accuracy_counts(outputs.logits.detach(), batch["labels"])
+            running_loss += outputs.loss.item() * batch_size
+            running_examples += batch_size
+            running_token_correct += correct_tokens
+            running_token_total += token_total
+            micro_loss_sum += outputs.loss.item() * batch_size
+            micro_examples += batch_size
+            micro_token_correct += correct_tokens
+            micro_token_total += token_total
+
+            should_step = (
+                step % config.training.gradient_accumulation_steps == 0
+                or step == len(train_loader)
+            )
+            if should_step:
+                grad_norm = compute_grad_norm(model)
+                grad_norm_max = max(grad_norm_max, grad_norm)
+                grad_norm_min = min(grad_norm_min, grad_norm)
+                clipping_triggered = grad_norm > config.training.max_grad_norm
+                if clipping_triggered:
+                    clipped_steps += 1
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                grad_norm_sum += grad_norm
+                optimizer_steps += 1
+                global_optimizer_step += 1
+                current_lr = (
+                    scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+                )
+
+                if optimizer_steps % max(1, config.training.step_metrics_every) == 0:
+                    step_history.append(
+                        GenerationStepRecord(
+                            epoch=epoch,
+                            optimizer_step=global_optimizer_step,
+                            optimizer_step_in_epoch=optimizer_steps,
+                            micro_step_end=step,
+                            train_loss=micro_loss_sum / max(1, micro_examples),
+                            train_token_accuracy=micro_token_correct / max(1, micro_token_total),
+                            grad_norm_pre_clip=grad_norm,
+                            clipping_triggered=clipping_triggered,
+                            learning_rate=current_lr,
+                            examples_seen_epoch=running_examples,
+                            elapsed_seconds=time.time() - start_time,
+                        )
+                    )
+                micro_loss_sum = 0.0
+                micro_examples = 0
+                micro_token_correct = 0
+                micro_token_total = 0
+
+                if optimizer_steps % max(1, config.training.log_every_steps) == 0:
+                    avg_loss = running_loss / max(1, running_examples)
+                    avg_token_accuracy = running_token_correct / max(1, running_token_total)
+                    print(
+                        f"epoch={epoch} step={optimizer_steps}/{steps_per_epoch} "
+                        f"train_loss={avg_loss:.4f} train_tok_acc={avg_token_accuracy:.4f} grad_norm={grad_norm:.4f} "
+                        f"clipped={clipping_triggered} lr={current_lr:.2e}"
+                    )
+
+        train_loss = running_loss / max(1, running_examples)
+        train_token_accuracy = running_token_correct / max(1, running_token_total)
+        val_loss, val_perplexity, val_token_accuracy = evaluate_generation(model, val_loader, device)
+        epoch_seconds = time.time() - start_time
+        peak_memory_gb = (
+            torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == "cuda" else 0.0
+        )
+        avg_grad_norm = grad_norm_sum / max(1, optimizer_steps)
+        learning_rate = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+        validation_improved = val_loss < best_val_loss
+
+        history.append(
+            GenerationEpochRecord(
+                epoch=epoch,
+                train_loss=train_loss,
+                train_token_accuracy=train_token_accuracy,
+                validation_loss=val_loss,
+                validation_perplexity=val_perplexity,
+                validation_token_accuracy=val_token_accuracy,
+                avg_grad_norm=avg_grad_norm,
+                max_grad_norm=grad_norm_max,
+                min_grad_norm=0.0 if grad_norm_min == float("inf") else grad_norm_min,
+                clipped_step_fraction=clipped_steps / max(1, optimizer_steps),
+                clipped_steps=clipped_steps,
+                learning_rate=learning_rate,
+                epoch_seconds=epoch_seconds,
+                peak_memory_gb=peak_memory_gb,
+                validation_improved=validation_improved,
+                best_validation_loss_so_far=min(best_val_loss, val_loss),
+                epochs_since_improvement=0 if validation_improved else stale_epochs + 1,
+            )
+        )
+
+        print(
+            f"[epoch {epoch}] train_loss={train_loss:.4f} train_tok_acc={train_token_accuracy:.4f} "
+            f"val_loss={val_loss:.4f} val_ppl={val_perplexity:.4f} val_tok_acc={val_token_accuracy:.4f} "
+            f"peak_mem_gb={peak_memory_gb:.2f}"
+        )
+
+        if validation_improved:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            last_improvement_epoch = epoch
+            stale_epochs = 0
+            if not config.training.summary_only:
+                checkpoints_dir.mkdir(parents=True, exist_ok=True)
+                model.save_pretrained(checkpoints_dir)
+                tokenizer.save_pretrained(checkpoints_dir)
+        else:
+            stale_epochs += 1
+            if stale_epochs >= config.training.patience:
+                print(
+                    f"Early stopping triggered after epoch {epoch}. "
+                    f"Best validation loss was {best_val_loss:.4f} at epoch {best_epoch}."
+                )
+                break
+
+    history_path = run_dir / "history.csv"
+    step_history_path = run_dir / "step_history.csv"
+    if not config.training.summary_only:
+        _write_history_csv(history_path, history)
+        _write_step_history_csv(step_history_path, step_history)
+
+    first_epoch = history[0] if history else None
+    best_record = min(history, key=lambda record: record.validation_loss) if history else None
+    summary = {
+        "dataset_name": config.data.dataset_name,
+        "base_run_dir": str(base_run_dir),
+        "resolved_run_dir": str(run_dir),
+        "train_examples": len(train_dataset),
+        "validation_examples": len(val_dataset),
+        "model_name_or_path": config.model.model_name_or_path,
+        "adaptation_method": "ttlora",
+        "task_type": "generation",
+        "target_weights": [weight.weight_name for weight in config.model.weight_configs],
+        "adapt_layers": list(config.model.adapt_layers) if config.model.adapt_layers is not None else None,
+        "seed": config.training.seed,
+        "learning_rate": config.training.learning_rate,
+        "lr_scheduler": config.training.lr_scheduler,
+        "batch_size": config.training.batch_size,
+        "eval_batch_size": config.training.eval_batch_size,
+        "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "max_grad_norm_threshold": config.training.max_grad_norm,
+        "num_workers": config.training.num_workers,
+        "summary_only": config.training.summary_only,
+        "ttlora_variant": config.model.ttlora_variant,
+        "ttlora_rank": config.model.ttlora_rank,
+        "ttlora_alpha": config.model.ttlora_alpha,
+        "ttlora_weight_configs": [
+            {
+                "weight_name": weight.weight_name,
+                "tt_shape": list(weight.tt_shape),
+                "input_factors": list(weight.input_factors),
+                "output_factors": list(weight.output_factors),
+                "weight_shape": list(weight.weight_shape) if weight.weight_shape is not None else None,
+            }
+            for weight in config.model.weight_configs
+        ],
+        "best_epoch": best_epoch,
+        "epochs_ran": len(history),
+        "epochs_to_best": best_epoch,
+        "last_improvement_epoch": last_improvement_epoch,
+        "epochs_since_last_improvement": (len(history) - last_improvement_epoch) if history and last_improvement_epoch else None,
+        "initial_validation_loss": first_epoch.validation_loss if first_epoch else None,
+        "initial_validation_perplexity": first_epoch.validation_perplexity if first_epoch else None,
+        "initial_validation_token_accuracy": first_epoch.validation_token_accuracy if first_epoch else None,
+        "best_validation_loss": best_val_loss if history else None,
+        "best_validation_perplexity": best_record.validation_perplexity if best_record else None,
+        "best_validation_token_accuracy": best_record.validation_token_accuracy if best_record else None,
+        "best_validation_accuracy": None,
+        "final_validation_accuracy": None,
+        "final_validation_loss": history[-1].validation_loss if history else None,
+        "final_validation_perplexity": history[-1].validation_perplexity if history else None,
+        "final_validation_token_accuracy": history[-1].validation_token_accuracy if history else None,
+        "max_peak_memory_gb": max((record.peak_memory_gb for record in history), default=0.0),
+        "avg_epoch_seconds": (
+            sum(record.epoch_seconds for record in history) / len(history) if history else 0.0
+        ),
+        "avg_grad_norm": (
+            sum(record.avg_grad_norm for record in history) / len(history) if history else 0.0
+        ),
+        "max_grad_norm": max((record.max_grad_norm for record in history), default=0.0),
+        "min_grad_norm": min((record.min_grad_norm for record in history), default=0.0),
+        "avg_clipped_step_fraction": (
+            sum(record.clipped_step_fraction for record in history) / len(history) if history else 0.0
+        ),
+        "total_clipped_steps": sum(record.clipped_steps for record in history),
+        "step_metrics_logged": len(step_history),
+        "history_path": str(history_path) if not config.training.summary_only else None,
+        "step_history_path": str(step_history_path) if not config.training.summary_only else None,
+        "best_checkpoint_dir": str(checkpoints_dir) if not config.training.summary_only else None,
+        "trainable_parameter_names": trainable_names,
+        **parameter_stats,
+        **config.metadata,
+    }
+    _save_json(run_dir / "summary.json", summary)
+    return summary
