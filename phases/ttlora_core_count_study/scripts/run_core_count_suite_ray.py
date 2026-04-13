@@ -73,6 +73,43 @@ def should_skip_run(
     return not rerun_failed
 
 
+def build_run_signature(spec_or_row: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        str(spec_or_row.get("dataset_name", "")),
+        str(spec_or_row.get("ttlora_variant", "")),
+        str(spec_or_row.get("total_cores", "")),
+        str(spec_or_row.get("seed", "")),
+        str(spec_or_row.get("learning_rate", "")),
+    )
+
+
+def collect_completed_runs_from_logs(paths: list[Path]) -> tuple[set[str], set[tuple[str, str, str, str, str]]]:
+    completed_run_names: set[str] = set()
+    completed_signatures: set[tuple[str, str, str, str, str]] = set()
+    for path in paths:
+        for row in load_execution_log(path):
+            if str(row.get("returncode", "")) != "0":
+                continue
+            run_name = str(row.get("run_name", "")).strip()
+            if run_name:
+                completed_run_names.add(run_name)
+            completed_signatures.add(build_run_signature(row))
+    return completed_run_names, completed_signatures
+
+
+def summary_exists_for_run(spec: dict[str, Any]) -> bool:
+    summary_path = Path(spec["dataset_runs_root"]) / spec["run_name"] / "summary.json"
+    if not summary_path.exists():
+        return False
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(summary, dict):
+        return False
+    return bool(summary)
+
+
 def read_summary(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     summary_path = Path(spec["dataset_runs_root"]) / spec["run_name"] / "summary.json"
     if not summary_path.exists():
@@ -184,6 +221,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --resume, rerun failed entries instead of skipping them.",
     )
     parser.add_argument(
+        "--resume-from-summaries",
+        action="store_true",
+        help=(
+            "Also skip runs that already have a non-empty summary.json in their expected run directory. "
+            "Useful when running from another machine with only the manifest and shared run outputs."
+        ),
+    )
+    parser.add_argument(
+        "--completed-log-csv",
+        action="append",
+        default=None,
+        help=(
+            "Repeatable path to an execution_log.csv file from another machine or earlier run. "
+            "Rows with returncode=0 are treated as already completed and skipped."
+        ),
+    )
+    parser.add_argument(
         "--include-datasets",
         nargs="*",
         default=None,
@@ -227,6 +281,10 @@ def main() -> None:
 
     execution_log_path = suite_dir / args.log_name
     execution_rows = load_execution_log(execution_log_path)
+    completed_log_paths = [Path(path).expanduser().resolve() for path in (args.completed_log_csv or [])]
+    completed_run_names_from_logs, completed_signatures_from_logs = collect_completed_runs_from_logs(
+        completed_log_paths
+    )
 
     include_datasets = set(args.include_datasets or [])
     include_variants = set(args.include_variants or [])
@@ -242,6 +300,19 @@ def main() -> None:
             continue
         if should_skip_run(spec["run_name"], execution_rows, args.resume, args.rerun_failed):
             print(f"[resume] Skipping completed run {spec['run_name']}", flush=True)
+            continue
+        if spec["run_name"] in completed_run_names_from_logs:
+            print(f"[resume-log] Skipping run from completed log {spec['run_name']}", flush=True)
+            continue
+        if build_run_signature(spec) in completed_signatures_from_logs:
+            print(
+                f"[resume-log] Skipping run by signature "
+                f"{spec['dataset_name']} {spec['ttlora_variant']} cores={spec['total_cores']} seed={spec['seed']}",
+                flush=True,
+            )
+            continue
+        if args.resume_from_summaries and summary_exists_for_run(spec):
+            print(f"[resume-summary] Skipping run with existing summary {spec['run_name']}", flush=True)
             continue
         filtered_specs.append(spec)
 
