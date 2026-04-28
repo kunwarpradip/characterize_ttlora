@@ -14,8 +14,6 @@ suites/
 gpt2small/
 llama2-7b/
 datasets/alpaca/
-datasets/cnn/
-datasets/gsm8k/
 datasets/wikitext/
 *.svg
 *.csv
