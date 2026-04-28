@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -95,6 +97,28 @@ def _save_json(path: Path, payload: dict) -> None:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
+def _setup_run_logger(run_dir: Path) -> tuple[logging.Logger, Path]:
+    log_path = run_dir / "training.log"
+    logger_name = f"cttlora.generation.{run_dir.resolve()}"
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger, log_path
+
+
 def _safe_perplexity(loss_value: float) -> float:
     return float(math.exp(min(loss_value, 20.0)))
 
@@ -160,6 +184,23 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
     base_run_dir = config.run_dir()
     run_dir = prepare_run_dir(base_run_dir, config.training.overwrite_run_dir)
     checkpoints_dir = run_dir / "checkpoints" / "best"
+    logger, log_path = _setup_run_logger(run_dir)
+
+    logger.info("Starting generation TT-LoRA run")
+    logger.info("Run directory: %s", run_dir)
+    logger.info("Training log: %s", log_path)
+    logger.info("Dataset config: %s", config.data)
+    logger.info("Model path: %s", config.model.model_name_or_path)
+    logger.info("Tokenizer path: %s", config.model.tokenizer_name_or_path)
+    logger.info(
+        "TT-LoRA config: variant=%s rank=%s alpha=%s weights=%s adapt_layers=%s",
+        config.model.ttlora_variant,
+        config.model.ttlora_rank,
+        config.model.ttlora_alpha,
+        [weight.weight_name for weight in config.model.weight_configs],
+        config.model.adapt_layers,
+    )
+    logger.info("Training config: %s", config.training)
 
     tokenizer, train_dataset, val_dataset, train_loader, val_loader = prepare_generation_data(
         data_config=config.data,
@@ -168,16 +209,29 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         eval_batch_size=config.training.eval_batch_size,
         num_workers=config.training.num_workers,
     )
+    logger.info(
+        "Prepared data: train_examples=%d validation_examples=%d train_batches=%d validation_batches=%d tokenizer=%s",
+        len(train_dataset),
+        len(val_dataset),
+        len(train_loader),
+        len(val_loader),
+        type(tokenizer).__name__,
+    )
     model = load_generation_model(config.model)
     parameter_stats = count_parameters(model)
+    logger.info("Loaded model: %s", type(model).__name__)
+    logger.info("Parameter stats: %s", parameter_stats)
 
     trainable_names = [] if config.training.summary_only else trainable_parameter_names(model)
+    logger.info("Trainable parameter tensors: %d", len(trainable_names))
     device = resolve_device(config.training.device)
     model.to(device)
+    logger.info("Resolved device: %s", device)
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
+        logger.info("CUDA device name: %s", torch.cuda.get_device_name(device))
 
     optimizer = AdamW(
         parameter_groups(model, config.training.weight_decay),
@@ -186,6 +240,12 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
     steps_per_epoch = math.ceil(len(train_loader) / max(1, config.training.gradient_accumulation_steps))
     total_steps = max(1, steps_per_epoch * config.training.epochs)
     scheduler = build_scheduler(optimizer, config, total_steps)
+    logger.info(
+        "Optimization setup: steps_per_epoch=%d total_steps=%d scheduler=%s",
+        steps_per_epoch,
+        total_steps,
+        type(scheduler).__name__ if scheduler is not None else "none",
+    )
 
     best_val_loss = float("inf")
     best_epoch = 0
@@ -197,11 +257,13 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
 
     if not config.training.summary_only:
         _save_json(run_dir / "config.json", config.to_dict())
+        logger.info("Wrote config.json")
 
     for epoch in range(1, config.training.epochs + 1):
         model.train()
         start_time = time.time()
         optimizer.zero_grad(set_to_none=True)
+        logger.info("Starting epoch %d/%d", epoch, config.training.epochs)
 
         running_loss = 0.0
         running_examples = 0
@@ -281,7 +343,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 if optimizer_steps % max(1, config.training.log_every_steps) == 0:
                     avg_loss = running_loss / max(1, running_examples)
                     avg_token_accuracy = running_token_correct / max(1, running_token_total)
-                    print(
+                    logger.info(
                         f"epoch={epoch} step={optimizer_steps}/{steps_per_epoch} "
                         f"train_loss={avg_loss:.4f} train_tok_acc={avg_token_accuracy:.4f} grad_norm={grad_norm:.4f} "
                         f"clipped={clipping_triggered} lr={current_lr:.2e}"
@@ -320,10 +382,10 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             )
         )
 
-        print(
+        logger.info(
             f"[epoch {epoch}] train_loss={train_loss:.4f} train_tok_acc={train_token_accuracy:.4f} "
             f"val_loss={val_loss:.4f} val_ppl={val_perplexity:.4f} val_tok_acc={val_token_accuracy:.4f} "
-            f"peak_mem_gb={peak_memory_gb:.2f}"
+            f"peak_mem_gb={peak_memory_gb:.2f} improved={validation_improved}"
         )
 
         if validation_improved:
@@ -335,10 +397,11 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 checkpoints_dir.mkdir(parents=True, exist_ok=True)
                 model.save_pretrained(checkpoints_dir)
                 tokenizer.save_pretrained(checkpoints_dir)
+                logger.info("Saved new best checkpoint: %s", checkpoints_dir)
         else:
             stale_epochs += 1
             if stale_epochs >= config.training.patience:
-                print(
+                logger.info(
                     f"Early stopping triggered after epoch {epoch}. "
                     f"Best validation loss was {best_val_loss:.4f} at epoch {best_epoch}."
                 )
@@ -349,6 +412,8 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
     if not config.training.summary_only:
         _write_history_csv(history_path, history)
         _write_step_history_csv(step_history_path, step_history)
+        logger.info("Wrote history: %s", history_path)
+        logger.info("Wrote step history: %s", step_history_path)
 
     first_epoch = history[0] if history else None
     best_record = min(history, key=lambda record: record.validation_loss) if history else None
@@ -418,9 +483,17 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "history_path": str(history_path) if not config.training.summary_only else None,
         "step_history_path": str(step_history_path) if not config.training.summary_only else None,
         "best_checkpoint_dir": str(checkpoints_dir) if not config.training.summary_only else None,
+        "training_log_path": str(log_path),
         "trainable_parameter_names": trainable_names,
         **parameter_stats,
         **config.metadata,
     }
     _save_json(run_dir / "summary.json", summary)
+    logger.info("Wrote summary: %s", run_dir / "summary.json")
+    logger.info(
+        "Run finished: best_epoch=%s best_validation_loss=%s best_validation_perplexity=%s",
+        summary["best_epoch"],
+        summary["best_validation_loss"],
+        summary["best_validation_perplexity"],
+    )
     return summary

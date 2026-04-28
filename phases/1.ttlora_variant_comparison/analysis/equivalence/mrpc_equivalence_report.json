@@ -1,0 +1,13 @@
+{
+  "atol": 1e-05,
+  "equivalent_within_tolerance": true,
+  "first_ttlora_module": "roberta.encoder.layer.0.attention.self.query",
+  "logits_allclose": true,
+  "logits_max_abs_diff": 5.960464477539063e-08,
+  "loss_abs_diff": 0.0,
+  "max_tt_core_grad_abs_diff": 1.178705133497715e-09,
+  "num_tt_core_grad_tensors": 144,
+  "rtol": 1e-05,
+  "standalone_forward_allclose": true,
+  "standalone_forward_max_abs_diff": 4.604458808898926e-06
+}

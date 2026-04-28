@@ -1,0 +1,13 @@
+{
+  "adapted_weights_per_layer": 3,
+  "allow_one_factors": false,
+  "num_core_counts": 17,
+  "num_layers": 12,
+  "num_shapes": 1638400,
+  "rank": 6,
+  "split_strategy": "all",
+  "weight_shape": [
+    768,
+    768
+  ]
+}

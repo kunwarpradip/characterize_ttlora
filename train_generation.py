@@ -31,6 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save only summary.json and skip history/checkpoint artifacts.",
     )
     parser.add_argument("--max-length", type=int, default=1024)
+    parser.add_argument("--train-split", default="train")
+    parser.add_argument("--validation-split", default="validation")
+    parser.add_argument("--text-column", default="text")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -127,6 +130,9 @@ def main() -> None:
             dataset_name=args.dataset_name,
             dataset_root=args.dataset_root,
             max_length=args.max_length,
+            train_split=args.train_split,
+            validation_split=args.validation_split,
+            text_column=args.text_column,
             max_train_samples=args.max_train_samples,
             max_eval_samples=args.max_eval_samples,
         ),

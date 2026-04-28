@@ -1,0 +1,35 @@
+1. use plot_lowest_parameter_counts.ipynb notebook to generate the lowest parameter tt-shapes for the given
+rank and the weights of the model to be adapted. 
+
+2. Use this terminal command to run the suite of the variants
+##FOR Gnereation TASK
+python /home/pkunwar/characterize_ttlora/phases/ttlora_core_count_study/scripts/run_core_count_suite.py \
+  --suite-name gpt2_enron_ptb_core_study \
+  --dataset-names enron ptb \
+  --variants reconstruction contraction\
+  --generation-weight-spec c_attn=/home/pkunwar/characterize_ttlora/phases/ttlora_core_count_study/analysis/parameter_space_notebook_gpt2small/lowest_parameter_shapes_by_core_count.csv \
+  --adapt-layers 1 2 3 4 5 6 7 8 9 10 11 12 \
+  --ttlora-rank 6 \
+  --batch-size 32 \
+  --eval-batch-size 32 \
+  --gradient-accumulation-steps 1 \
+  --gpu-id 1
+
+##FOR CLASSIFICATION TASK
+python /home/pkunwar/characterize_ttlora/phases/ttlora_core_count_study/scripts/run_core_count_suite.py \
+  --suite-name roberta_mrpc_csqa_core_study \
+  --dataset-names csqa mrpc\
+  --variants reconstruction contraction \
+  --shape-csv /home/pkunwar/characterize_ttlora/phases/ttlora_core_count_study/analysis/parameter_space_notebook_roberta-base/lowest_parameter_shapes_by_core_count.csv \
+  --adapt-layers 1 2 3 4 5 6 7 8 9 10 11 12 \
+  --ttlora-rank 6 \
+  --batch-size 32 \
+  --eval-batch-size 32 \
+  --gradient-accumulation-steps 1 \
+  --gpu-id 1
+
+
+#change suite name
+#change dataset-names
+#change generation-weight-spec file which will load the csv to tt-shapes
+#change gpu-id

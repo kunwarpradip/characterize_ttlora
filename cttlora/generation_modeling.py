@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
 from .adapters import (
     freeze_model_parameters,
@@ -19,6 +20,17 @@ from .generation_config import GenerationModelConfig, TTLoRAWeightConfig
 GPT2_TARGET_MAP = {
     "c_attn": ("attn", "c_attn"),
     "c_proj": ("attn", "c_proj"),
+}
+
+LLAMA_TARGET_MAP = {
+    "q_proj": ("self_attn", "q_proj"),
+    "k_proj": ("self_attn", "k_proj"),
+    "v_proj": ("self_attn", "v_proj"),
+    "o_proj": ("self_attn", "o_proj"),
+    "wq": ("self_attn", "q_proj"),
+    "wk": ("self_attn", "k_proj"),
+    "wv": ("self_attn", "v_proj"),
+    "wo": ("self_attn", "o_proj"),
 }
 
 
@@ -132,6 +144,124 @@ def _should_adapt_layer(layer_idx: int, adapt_layers: tuple[int, ...] | None) ->
     return adapt_layers is None or layer_idx in adapt_layers
 
 
+def _llama_intermediate_size(hidden_size: int, multiple_of: int) -> int:
+    hidden_dim = int(2 * (4 * hidden_size) / 3)
+    return multiple_of * math.ceil(hidden_dim / multiple_of)
+
+
+def _is_original_llama_dir(model_path: str) -> bool:
+    path = Path(model_path).expanduser()
+    candidates = [path, path / "checkpoints"]
+    return any((candidate / "params.json").exists() for candidate in candidates)
+
+
+def _resolve_original_llama_dir(model_path: str) -> Path:
+    path = Path(model_path).expanduser()
+    for candidate in (path, path / "checkpoints"):
+        if (candidate / "params.json").exists():
+            return candidate
+    raise FileNotFoundError(f"Could not find original LLaMA params.json under {model_path}")
+
+
+def _load_original_llama_params(model_dir: Path) -> dict:
+    import json
+
+    return json.loads((model_dir / "params.json").read_text(encoding="utf-8"))
+
+
+def _llama_config_from_original(model_dir: Path) -> LlamaConfig:
+    params = _load_original_llama_params(model_dir)
+    hidden_size = int(params["dim"])
+    num_heads = int(params["n_heads"])
+    num_layers = int(params["n_layers"])
+    multiple_of = int(params.get("multiple_of", 256))
+    vocab_size = int(params.get("vocab_size", -1))
+    if vocab_size <= 0:
+        vocab_size = 32000
+    max_position_embeddings = 4096 if "llama2" in str(model_dir).lower() or "llama-2" in str(model_dir).lower() else 2048
+
+    return LlamaConfig(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        intermediate_size=_llama_intermediate_size(hidden_size, multiple_of),
+        num_hidden_layers=num_layers,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        hidden_act="silu",
+        max_position_embeddings=max_position_embeddings,
+        initializer_range=0.02,
+        rms_norm_eps=float(params.get("norm_eps", 1e-5)),
+        use_cache=True,
+        pad_token_id=2,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+    )
+
+
+def _map_original_llama_key(name: str) -> str | None:
+    if name == "tok_embeddings.weight":
+        return "model.embed_tokens.weight"
+    if name == "norm.weight":
+        return "model.norm.weight"
+    if name == "output.weight":
+        return "lm_head.weight"
+
+    replacements = {
+        ".attention.wq.weight": ".self_attn.q_proj.weight",
+        ".attention.wk.weight": ".self_attn.k_proj.weight",
+        ".attention.wv.weight": ".self_attn.v_proj.weight",
+        ".attention.wo.weight": ".self_attn.o_proj.weight",
+        ".feed_forward.w1.weight": ".mlp.gate_proj.weight",
+        ".feed_forward.w2.weight": ".mlp.down_proj.weight",
+        ".feed_forward.w3.weight": ".mlp.up_proj.weight",
+        ".attention_norm.weight": ".input_layernorm.weight",
+        ".ffn_norm.weight": ".post_attention_layernorm.weight",
+    }
+    if not name.startswith("layers."):
+        return None
+    for source, target in replacements.items():
+        if source in name:
+            return "model." + name.replace(source, target)
+    return None
+
+
+def _load_original_llama_state_dict(model_dir: Path) -> dict[str, torch.Tensor]:
+    checkpoint_paths = sorted(model_dir.glob("consolidated.*.pth"))
+    if not checkpoint_paths:
+        raise FileNotFoundError(f"No consolidated.*.pth files found in {model_dir}")
+
+    mapped: dict[str, torch.Tensor] = {}
+    for checkpoint_path in checkpoint_paths:
+        try:
+            state = torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
+        except TypeError:
+            state = torch.load(str(checkpoint_path), map_location="cpu")
+        for key, value in state.items():
+            mapped_key = _map_original_llama_key(str(key))
+            if mapped_key is not None:
+                mapped[mapped_key] = value
+    return mapped
+
+
+def load_original_llama_causal_lm(model_path: str) -> LlamaForCausalLM:
+    model_dir = _resolve_original_llama_dir(model_path)
+    config = _llama_config_from_original(model_dir)
+    model = LlamaForCausalLM(config)
+    state_dict = _load_original_llama_state_dict(model_dir)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    unexpected = [key for key in unexpected if not key.endswith("rotary_emb.inv_freq")]
+    if unexpected:
+        raise ValueError(f"Unexpected keys while loading original LLaMA checkpoint: {unexpected[:20]}")
+    important_missing = [
+        key for key in missing
+        if not key.endswith("rotary_emb.inv_freq")
+    ]
+    if important_missing:
+        raise ValueError(f"Missing keys while loading original LLaMA checkpoint: {important_missing[:20]}")
+    return model
+
+
 def apply_gpt2_ttlora(model, model_config: GenerationModelConfig):
     freeze_model_parameters(model)
     if not hasattr(model, "transformer") or not hasattr(model.transformer, "h"):
@@ -165,11 +295,54 @@ def apply_gpt2_ttlora(model, model_config: GenerationModelConfig):
     return model
 
 
+def apply_llama_ttlora(model, model_config: GenerationModelConfig):
+    freeze_model_parameters(model)
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("LLaMA TT-LoRA adaptation expects a model with model.layers blocks.")
+
+    wrapped_count = 0
+    for layer_idx, block in enumerate(model.model.layers):
+        if not _should_adapt_layer(layer_idx, model_config.adapt_layers):
+            continue
+        for weight_config in model_config.weight_configs:
+            weight_name = weight_config.weight_name.lower()
+            if weight_name not in LLAMA_TARGET_MAP:
+                supported = ", ".join(sorted(LLAMA_TARGET_MAP))
+                raise ValueError(
+                    f"Unsupported LLaMA target weight '{weight_config.weight_name}'. Supported: {supported}."
+                )
+            path = LLAMA_TARGET_MAP[weight_name]
+            original = _resolve_attr(block, path)
+            wrapped = TTLoRAGenerationWrapper(
+                original_layer=original,
+                weight_config=weight_config,
+                rank=model_config.ttlora_rank,
+                alpha=model_config.ttlora_alpha,
+                mode=model_config.ttlora_variant.lower(),
+            )
+            _assign_attr(block, path, wrapped)
+            wrapped_count += 1
+
+    if wrapped_count == 0:
+        raise ValueError("No LLaMA layers were adapted. Check the selected layers and weight configs.")
+    return model
+
+
+def apply_generation_ttlora(model, model_config: GenerationModelConfig):
+    model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
+    if model_type == "llama" or (hasattr(model, "model") and hasattr(model.model, "layers")):
+        return apply_llama_ttlora(model, model_config)
+    return apply_gpt2_ttlora(model, model_config)
+
+
 def load_generation_model(model_config: GenerationModelConfig):
-    model = AutoModelForCausalLM.from_pretrained(model_config.model_name_or_path)
+    if _is_original_llama_dir(model_config.model_name_or_path):
+        model = load_original_llama_causal_lm(model_config.model_name_or_path)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_config.model_name_or_path)
     if model.config.pad_token_id is None:
         eos_token_id = getattr(model.config, "eos_token_id", None)
         if isinstance(eos_token_id, list):
             eos_token_id = eos_token_id[0]
         model.config.pad_token_id = eos_token_id
-    return apply_gpt2_ttlora(model, model_config)
+    return apply_generation_ttlora(model, model_config)

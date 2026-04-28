@@ -1,0 +1,144 @@
+{
+  "metadata": {
+    "model": "llama2-7b",
+    "source": "/home/pkunwar/characterize_ttlora/phases/2.1.ttlora_core_count_study/analysis/parameter_space_notebook_llama2-7b/lowest_parameter_shapes_by_core_count.csv",
+    "selection": "lowest_parameter_count_total_cores_10",
+    "total_cores": 10,
+    "rank": 6,
+    "adapted_weights_per_layer": 4,
+    "num_layers": 32,
+    "per_matrix_params": 1344,
+    "per_layer_params": 5376,
+    "all_layers_params": 172032
+  },
+  "weights": {
+    "q_proj": {
+      "input_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "output_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "tt_shape": [
+        16,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        16
+      ],
+      "weight_shape": [
+        4096,
+        4096
+      ]
+    },
+    "k_proj": {
+      "input_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "output_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "tt_shape": [
+        16,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        16
+      ],
+      "weight_shape": [
+        4096,
+        4096
+      ]
+    },
+    "v_proj": {
+      "input_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "output_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "tt_shape": [
+        16,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        16
+      ],
+      "weight_shape": [
+        4096,
+        4096
+      ]
+    },
+    "o_proj": {
+      "input_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "output_factors": [
+        16,
+        4,
+        4,
+        4,
+        4
+      ],
+      "tt_shape": [
+        16,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        16
+      ],
+      "weight_shape": [
+        4096,
+        4096
+      ]
+    }
+  }
+}
