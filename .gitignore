@@ -30,3 +30,6 @@ phases/1.ttlora_variant_comparison/analysis
 phases/ttlora_core_count_study/runs/runs    
 phases/ttlora_core_count_study/suites/suites
 phases/ttlora_core_count_study/analysis/analysis
+phases*
+datasets/ptb/*
+core

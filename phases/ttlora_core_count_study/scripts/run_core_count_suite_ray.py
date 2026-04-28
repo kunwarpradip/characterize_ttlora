@@ -40,7 +40,39 @@ def write_execution_log(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def sanitize_command_for_ray(command: list[str]) -> list[str]:
+def parse_path_prefix_mappings(specs: list[str] | None) -> list[tuple[str, str]]:
+    mappings: list[tuple[str, str]] = []
+    for spec in specs or []:
+        if "=" not in spec:
+            raise ValueError(
+                f"Invalid --path-prefix-map value '{spec}'. Expected format OLD_PREFIX=NEW_PREFIX."
+            )
+        old_prefix, new_prefix = spec.split("=", 1)
+        old_prefix = old_prefix.strip()
+        new_prefix = new_prefix.strip()
+        if not old_prefix or not new_prefix:
+            raise ValueError(
+                f"Invalid --path-prefix-map value '{spec}'. Both OLD_PREFIX and NEW_PREFIX are required."
+            )
+        mappings.append((old_prefix, new_prefix))
+    mappings.sort(key=lambda item: len(item[0]), reverse=True)
+    return mappings
+
+
+def rewrite_path_token(token: str, mappings: list[tuple[str, str]]) -> str:
+    for old_prefix, new_prefix in mappings:
+        if token == old_prefix:
+            return new_prefix
+        if token.startswith(old_prefix + os.sep):
+            return new_prefix + token[len(old_prefix):]
+    return token
+
+
+def sanitize_command_for_ray(
+    command: list[str],
+    python_bin_override: str | None = None,
+    path_prefix_mappings: list[tuple[str, str]] | None = None,
+) -> list[str]:
     sanitized: list[str] = []
     skip_next = False
     for index, token in enumerate(command):
@@ -51,8 +83,23 @@ def sanitize_command_for_ray(command: list[str]) -> list[str]:
             skip_next = True
             continue
         sanitized.append(token)
+    mappings = path_prefix_mappings or []
+    if mappings:
+        sanitized = [rewrite_path_token(token, mappings) for token in sanitized]
+    if python_bin_override:
+        sanitized[0] = python_bin_override
     sanitized.extend(["--device", "cuda"])
     return sanitized
+
+
+def sanitize_cwd_for_ray(
+    cwd: str | None,
+    path_prefix_mappings: list[tuple[str, str]] | None = None,
+) -> str | None:
+    if cwd is None:
+        return None
+    mappings = path_prefix_mappings or []
+    return rewrite_path_token(cwd, mappings) if mappings else cwd
 
 
 def should_skip_run(
@@ -266,6 +313,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print filtered runs without submitting them to Ray.",
     )
+    parser.add_argument(
+        "--python-bin-override",
+        default=None,
+        help="Override the Python executable embedded in the manifest commands.",
+    )
+    parser.add_argument(
+        "--path-prefix-map",
+        action="append",
+        default=None,
+        help=(
+            "Repeatable OLD_PREFIX=NEW_PREFIX remapping applied to manifest command paths and cwd. "
+            "Use this when the manifest was generated on another machine."
+        ),
+    )
     return parser
 
 
@@ -278,6 +339,7 @@ def main() -> None:
     suite_dir = manifest_path.parent
     logs_dir = suite_dir / "ray_task_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    path_prefix_mappings = parse_path_prefix_mappings(args.path_prefix_map)
 
     execution_log_path = suite_dir / args.log_name
     execution_rows = load_execution_log(execution_log_path)
@@ -314,6 +376,13 @@ def main() -> None:
         if args.resume_from_summaries and summary_exists_for_run(spec):
             print(f"[resume-summary] Skipping run with existing summary {spec['run_name']}", flush=True)
             continue
+        spec = dict(spec)
+        spec["ray_command"] = sanitize_command_for_ray(
+            list(spec["command"]),
+            python_bin_override=args.python_bin_override,
+            path_prefix_mappings=path_prefix_mappings,
+        )
+        spec["ray_cwd"] = sanitize_cwd_for_ray(spec.get("cwd"), path_prefix_mappings=path_prefix_mappings)
         filtered_specs.append(spec)
 
     if not filtered_specs:
@@ -327,7 +396,9 @@ def main() -> None:
     if args.dry_run:
         for spec in filtered_specs:
             print(f"[dry-run] {spec['run_name']}", flush=True)
-            print(" ".join(sanitize_command_for_ray(spec["command"])), flush=True)
+            print(" ".join(spec["ray_command"]), flush=True)
+            if spec.get("ray_cwd"):
+                print(f"[cwd] {spec['ray_cwd']}", flush=True)
         return
 
     import ray
@@ -336,7 +407,7 @@ def main() -> None:
 
     @ray.remote(num_cpus=args.cpus_per_run, num_gpus=args.gpus_per_run)
     def run_one(spec: dict[str, Any], logs_dir_str: str) -> dict[str, Any]:
-        command = sanitize_command_for_ray(list(spec["command"]))
+        command = list(spec["ray_command"])
         logs_dir = Path(logs_dir_str)
         stdout_path = logs_dir / f"{spec['run_name']}.stdout.log"
         stderr_path = logs_dir / f"{spec['run_name']}.stderr.log"
@@ -353,7 +424,7 @@ def main() -> None:
         ) as stderr_handle:
             result = subprocess.run(
                 command,
-                cwd=spec.get("cwd"),
+                cwd=spec.get("ray_cwd"),
                 env=env,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
