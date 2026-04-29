@@ -199,11 +199,16 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
     logger.info("Model path: %s", config.model.model_name_or_path)
     logger.info("Tokenizer path: %s", config.model.tokenizer_name_or_path)
     logger.info(
-        "TT-LoRA config: variant=%s rank=%s alpha=%s weights=%s adapt_layers=%s",
+        "Adaptation config: method=%s ttlora_variant=%s ttlora_rank=%s ttlora_alpha=%s "
+        "ttlora_weights=%s lora_rank=%s lora_alpha=%s lora_weights=%s adapt_layers=%s",
+        config.model.adaptation_method,
         config.model.ttlora_variant,
         config.model.ttlora_rank,
         config.model.ttlora_alpha,
         [weight.weight_name for weight in config.model.weight_configs],
+        config.model.lora_rank,
+        config.model.lora_alpha,
+        list(config.model.lora_target_weights),
         config.model.adapt_layers,
     )
     logger.info("Training config: %s", config.training)
@@ -487,9 +492,13 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "validation_blocks": data_stats.validation_blocks,
         "block_size": data_stats.block_size,
         "model_name_or_path": config.model.model_name_or_path,
-        "adaptation_method": "ttlora",
+        "adaptation_method": config.model.adaptation_method,
         "task_type": "generation",
-        "target_weights": [weight.weight_name for weight in config.model.weight_configs],
+        "target_weights": (
+            [weight.weight_name for weight in config.model.weight_configs]
+            if config.model.adaptation_method == "ttlora"
+            else list(config.model.lora_target_weights)
+        ),
         "adapt_layers": list(config.model.adapt_layers) if config.model.adapt_layers is not None else None,
         "seed": config.training.seed,
         "learning_rate": config.training.learning_rate,
@@ -503,6 +512,13 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "ttlora_variant": config.model.ttlora_variant,
         "ttlora_rank": config.model.ttlora_rank,
         "ttlora_alpha": config.model.ttlora_alpha,
+        "lora_rank": config.model.lora_rank if config.model.adaptation_method == "lora" else None,
+        "lora_alpha": config.model.lora_alpha if config.model.adaptation_method == "lora" else None,
+        "lora_target_weights": (
+            list(config.model.lora_target_weights)
+            if config.model.adaptation_method == "lora"
+            else None
+        ),
         "ttlora_weight_configs": [
             {
                 "weight_name": weight.weight_name,

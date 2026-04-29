@@ -22,7 +22,11 @@ class GenerationModelConfig:
     ttlora_alpha: float
     ttlora_variant: str
     weight_configs: tuple[TTLoRAWeightConfig, ...]
+    adaptation_method: str = "ttlora"
     adapt_layers: tuple[int, ...] | None = None
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_target_weights: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
 
 
 @dataclass(slots=True)

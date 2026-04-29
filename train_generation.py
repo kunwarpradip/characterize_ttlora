@@ -59,7 +59,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--log-every-steps", type=int, default=20)
     parser.add_argument("--step-metrics-every", type=int, default=1)
-    parser.add_argument("--ttlora-rank", type=int, required=True)
+    parser.add_argument(
+        "--adaptation-method",
+        default="ttlora",
+        choices=("ttlora", "lora"),
+        help="Generation adaptation method. Use lora for a plain LoRA baseline.",
+    )
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument(
+        "--lora-target-weights",
+        nargs="*",
+        default=("q_proj", "k_proj", "v_proj", "o_proj"),
+        help="LLaMA attention weights to adapt for plain LoRA.",
+    )
+    parser.add_argument("--ttlora-rank", type=int, default=6)
     parser.add_argument("--ttlora-alpha", type=float, default=8.0)
     parser.add_argument(
         "--ttlora-variant",
@@ -68,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ttlora-weight-config",
-        required=True,
+        default=None,
         help="Path to a per-run JSON file describing the adapted GPT-2 weights and their TT shapes.",
     )
     parser.add_argument(
@@ -125,8 +139,18 @@ def main() -> None:
 
     model_path = args.model_path
     tokenizer_path = args.tokenizer_path or model_path
-    run_name = args.run_name or f"generation_{args.dataset_name}_{args.ttlora_variant}"
-    weight_config_path = Path(args.ttlora_weight_config).expanduser().resolve()
+    run_name = args.run_name or (
+        f"generation_{args.dataset_name}_{args.ttlora_variant}"
+        if args.adaptation_method == "ttlora"
+        else f"generation_{args.dataset_name}_lora"
+    )
+    weight_config_path = (
+        Path(args.ttlora_weight_config).expanduser().resolve()
+        if args.ttlora_weight_config is not None
+        else None
+    )
+    if args.adaptation_method == "ttlora" and weight_config_path is None:
+        parser.error("--ttlora-weight-config is required when --adaptation-method ttlora")
 
     experiment = GenerationExperimentConfig(
         model=GenerationModelConfig(
@@ -135,8 +159,12 @@ def main() -> None:
             ttlora_rank=args.ttlora_rank,
             ttlora_alpha=args.ttlora_alpha,
             ttlora_variant=args.ttlora_variant,
-            weight_configs=load_weight_configs(weight_config_path),
+            weight_configs=load_weight_configs(weight_config_path) if weight_config_path is not None else (),
+            adaptation_method=args.adaptation_method,
             adapt_layers=tuple(args.adapt_layers) if args.adapt_layers else None,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_target_weights=tuple(args.lora_target_weights),
         ),
         data=GenerationDataConfig(
             dataset_name=args.dataset_name,
@@ -174,7 +202,7 @@ def main() -> None:
         notes=args.notes,
         metadata={
             "phase": "ttlora_core_count_study",
-            "ttlora_weight_config_path": str(weight_config_path),
+            "ttlora_weight_config_path": str(weight_config_path) if weight_config_path is not None else None,
         },
     )
     summary = run_generation_experiment(experiment)

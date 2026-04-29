@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
 from .adapters import (
+    LoRALinearWrapper,
     freeze_model_parameters,
     generate_tt_cores,
     reconstruct_tt_weight_matrix,
@@ -328,11 +329,60 @@ def apply_llama_ttlora(model, model_config: GenerationModelConfig):
     return model
 
 
+def apply_llama_lora(model, model_config: GenerationModelConfig):
+    freeze_model_parameters(model)
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise ValueError("LLaMA LoRA adaptation expects a model with model.layers blocks.")
+
+    wrapped_count = 0
+    for layer_idx, block in enumerate(model.model.layers):
+        if not _should_adapt_layer(layer_idx, model_config.adapt_layers):
+            continue
+        for weight_name in model_config.lora_target_weights:
+            normalized_weight_name = weight_name.lower()
+            if normalized_weight_name not in LLAMA_TARGET_MAP:
+                supported = ", ".join(sorted(LLAMA_TARGET_MAP))
+                raise ValueError(
+                    f"Unsupported LLaMA LoRA target weight '{weight_name}'. Supported: {supported}."
+                )
+            path = LLAMA_TARGET_MAP[normalized_weight_name]
+            original = _resolve_attr(block, path)
+            if not isinstance(original, nn.Linear):
+                raise TypeError(f"LLaMA LoRA expects nn.Linear targets, got {type(original)} for {weight_name}.")
+            wrapped = LoRALinearWrapper(
+                original_layer=original,
+                rank=model_config.lora_rank,
+                alpha=model_config.lora_alpha,
+            )
+            _assign_attr(block, path, wrapped)
+            wrapped_count += 1
+
+    if wrapped_count == 0:
+        raise ValueError("No LLaMA LoRA layers were adapted. Check the selected layers and target weights.")
+    return model
+
+
 def apply_generation_ttlora(model, model_config: GenerationModelConfig):
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
     if model_type == "llama" or (hasattr(model, "model") and hasattr(model.model, "layers")):
         return apply_llama_ttlora(model, model_config)
     return apply_gpt2_ttlora(model, model_config)
+
+
+def apply_generation_lora(model, model_config: GenerationModelConfig):
+    model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
+    if model_type == "llama" or (hasattr(model, "model") and hasattr(model.model, "layers")):
+        return apply_llama_lora(model, model_config)
+    raise ValueError("Generation LoRA is currently implemented for LLaMA-style nn.Linear attention weights.")
+
+
+def apply_generation_adaptation(model, model_config: GenerationModelConfig):
+    method = model_config.adaptation_method.lower()
+    if method == "ttlora":
+        return apply_generation_ttlora(model, model_config)
+    if method == "lora":
+        return apply_generation_lora(model, model_config)
+    raise ValueError(f"Unsupported generation adaptation method: {model_config.adaptation_method}")
 
 
 def load_generation_model(model_config: GenerationModelConfig):
@@ -345,4 +395,4 @@ def load_generation_model(model_config: GenerationModelConfig):
         if isinstance(eos_token_id, list):
             eos_token_id = eos_token_id[0]
         model.config.pad_token_id = eos_token_id
-    return apply_generation_ttlora(model, model_config)
+    return apply_generation_adaptation(model, model_config)
