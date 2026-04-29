@@ -143,6 +143,8 @@ def evaluate_gsm8k_exact_match(
     max_eval_samples: int | None = None,
     batch_size: int = 1,
     max_new_tokens: int = 256,
+    logger=None,
+    log_every: int = 25,
 ) -> GSM8KEvaluationSummary:
     rows = load_gsm8k_eval_rows(data_config)
     if max_eval_samples is not None:
@@ -154,9 +156,17 @@ def evaluate_gsm8k_exact_match(
 
     records: list[GSM8KEvaluationRecord] = []
     model.eval()
+    if logger is not None:
+        logger.info(
+            "GSM8K exact-match generation loop: examples=%d batch_size=%d max_new_tokens=%d",
+            len(rows),
+            max(1, batch_size),
+            max_new_tokens,
+        )
     with torch.no_grad():
         for start in range(0, len(rows), max(1, batch_size)):
-            batch_rows = rows.select(range(start, min(start + max(1, batch_size), len(rows))))
+            batch_end = min(start + max(1, batch_size), len(rows))
+            batch_rows = rows.select(range(start, batch_end))
             prompts = [_gsm8k_prompt(question) for question in batch_rows["question"]]
             encoded = _encode_prompts(tokenizer, prompts, max_prompt_length, device)
             prompt_lengths = encoded["attention_mask"].sum(dim=1).detach().cpu().tolist()
@@ -184,6 +194,16 @@ def evaluate_gsm8k_exact_match(
                         predicted_number=predicted_number,
                         exact_match=gold_number is not None and gold_number == predicted_number,
                     )
+                )
+            if logger is not None and (
+                batch_end == len(rows) or batch_end % max(1, log_every) < max(1, batch_size)
+            ):
+                running_matches = sum(1 for record in records if record.exact_match)
+                logger.info(
+                    "GSM8K exact-match progress: %d/%d generated current_accuracy=%.4f",
+                    batch_end,
+                    len(rows),
+                    running_matches / max(1, len(records)),
                 )
 
     exact_matches = sum(1 for record in records if record.exact_match)

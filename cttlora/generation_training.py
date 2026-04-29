@@ -442,6 +442,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             max_eval_samples=gsm8k_eval_limit,
             batch_size=config.training.eval_batch_size,
             max_new_tokens=config.data.generation_eval_max_new_tokens,
+            logger=logger,
         )
         logger.info(
             "GSM8K exact-match evaluation complete: accuracy=%.4f exact_matches=%d/%d predictions=%s",
