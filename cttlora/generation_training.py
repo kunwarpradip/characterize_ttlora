@@ -20,6 +20,7 @@ from transformers import (
 
 from .generation_config import GenerationExperimentConfig
 from .generation_data import prepare_generation_data
+from .generation_eval import evaluate_gsm8k_exact_match, is_gsm8k_dataset
 from .generation_modeling import load_generation_model
 from .modeling import count_parameters, parameter_groups, trainable_parameter_names
 from .training import compute_grad_norm, prepare_run_dir, resolve_device
@@ -202,7 +203,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
     )
     logger.info("Training config: %s", config.training)
 
-    tokenizer, train_dataset, val_dataset, train_loader, val_loader = prepare_generation_data(
+    tokenizer, train_dataset, val_dataset, train_loader, val_loader, data_stats = prepare_generation_data(
         data_config=config.data,
         tokenizer_name_or_path=config.model.tokenizer_name_or_path,
         batch_size=config.training.batch_size,
@@ -210,9 +211,13 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         num_workers=config.training.num_workers,
     )
     logger.info(
-        "Prepared data: train_examples=%d validation_examples=%d train_batches=%d validation_batches=%d tokenizer=%s",
-        len(train_dataset),
-        len(val_dataset),
+        "Prepared data: train_rows=%d validation_rows=%d train_blocks=%d validation_blocks=%d "
+        "block_size=%d train_batches=%d validation_batches=%d tokenizer=%s",
+        data_stats.train_rows,
+        data_stats.validation_rows,
+        data_stats.train_blocks,
+        data_stats.validation_blocks,
+        data_stats.block_size,
         len(train_loader),
         len(val_loader),
         type(tokenizer).__name__,
@@ -415,14 +420,53 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         logger.info("Wrote history: %s", history_path)
         logger.info("Wrote step history: %s", step_history_path)
 
+    gsm8k_eval_summary = None
+    if is_gsm8k_dataset(config.data.dataset_name):
+        gsm8k_predictions_path = None if config.training.summary_only else run_dir / "gsm8k_predictions.csv"
+        gsm8k_eval_limit = (
+            config.data.generation_eval_samples
+            if config.data.generation_eval_samples is not None
+            else config.data.max_eval_samples
+        )
+        logger.info(
+            "Starting GSM8K exact-match evaluation: samples=%s max_new_tokens=%d",
+            gsm8k_eval_limit if gsm8k_eval_limit is not None else "all",
+            config.data.generation_eval_max_new_tokens,
+        )
+        gsm8k_eval_summary = evaluate_gsm8k_exact_match(
+            model=model,
+            tokenizer=tokenizer,
+            data_config=config.data,
+            device=device,
+            output_path=gsm8k_predictions_path,
+            max_eval_samples=gsm8k_eval_limit,
+            batch_size=config.training.eval_batch_size,
+            max_new_tokens=config.data.generation_eval_max_new_tokens,
+        )
+        logger.info(
+            "GSM8K exact-match evaluation complete: accuracy=%.4f exact_matches=%d/%d predictions=%s",
+            gsm8k_eval_summary.exact_match_accuracy,
+            gsm8k_eval_summary.exact_matches,
+            gsm8k_eval_summary.evaluated_examples,
+            gsm8k_eval_summary.predictions_path,
+        )
+
     first_epoch = history[0] if history else None
     best_record = min(history, key=lambda record: record.validation_loss) if history else None
+    gsm8k_accuracy = (
+        gsm8k_eval_summary.exact_match_accuracy if gsm8k_eval_summary is not None else None
+    )
     summary = {
         "dataset_name": config.data.dataset_name,
         "base_run_dir": str(base_run_dir),
         "resolved_run_dir": str(run_dir),
         "train_examples": len(train_dataset),
         "validation_examples": len(val_dataset),
+        "train_rows": data_stats.train_rows,
+        "validation_rows": data_stats.validation_rows,
+        "train_blocks": data_stats.train_blocks,
+        "validation_blocks": data_stats.validation_blocks,
+        "block_size": data_stats.block_size,
         "model_name_or_path": config.model.model_name_or_path,
         "adaptation_method": "ttlora",
         "task_type": "generation",
@@ -462,7 +506,17 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "best_validation_perplexity": best_record.validation_perplexity if best_record else None,
         "best_validation_token_accuracy": best_record.validation_token_accuracy if best_record else None,
         "best_validation_accuracy": None,
-        "final_validation_accuracy": None,
+        "final_validation_accuracy": gsm8k_accuracy,
+        "gsm8k_exact_match_accuracy": gsm8k_accuracy,
+        "gsm8k_exact_matches": (
+            gsm8k_eval_summary.exact_matches if gsm8k_eval_summary is not None else None
+        ),
+        "gsm8k_evaluated_examples": (
+            gsm8k_eval_summary.evaluated_examples if gsm8k_eval_summary is not None else None
+        ),
+        "gsm8k_predictions_path": (
+            gsm8k_eval_summary.predictions_path if gsm8k_eval_summary is not None else None
+        ),
         "final_validation_loss": history[-1].validation_loss if history else None,
         "final_validation_perplexity": history[-1].validation_perplexity if history else None,
         "final_validation_token_accuracy": history[-1].validation_token_accuracy if history else None,

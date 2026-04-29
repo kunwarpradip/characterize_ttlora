@@ -1,0 +1,35 @@
+{
+  "description": "Lowest-parameter 10-core TT-LoRA shapes for Llama 3.2 1B attention. q_proj/o_proj use 2048x2048 QO shapes; k_proj/v_proj use 512x2048 KV shapes.",
+  "model": "llama3.2-1b",
+  "source": {
+    "q_proj_o_proj": "/home/pkunwar/characterize_ttlora/phases/2.1.ttlora_core_count_study/analysis/parameter_space_notebook_llama3.2-1b_qo/lowest_parameter_shapes_by_core_count.csv",
+    "k_proj_v_proj": "/home/pkunwar/characterize_ttlora/phases/2.1.ttlora_core_count_study/analysis/parameter_space_notebook_llama3.2-1b_kv/lowest_parameter_shapes_by_core_count.csv",
+    "total_cores": 10
+  },
+  "weights": {
+    "q_proj": {
+      "weight_shape": [2048, 2048],
+      "input_factors": [16, 2, 4, 4, 4],
+      "output_factors": [16, 2, 4, 4, 4],
+      "tt_shape": [16, 2, 4, 4, 4, 4, 4, 4, 2, 16]
+    },
+    "k_proj": {
+      "weight_shape": [512, 2048],
+      "input_factors": [16, 2, 4, 4, 4],
+      "output_factors": [16, 2, 2, 2, 4],
+      "tt_shape": [16, 2, 4, 4, 4, 4, 2, 2, 2, 16]
+    },
+    "v_proj": {
+      "weight_shape": [512, 2048],
+      "input_factors": [16, 2, 4, 4, 4],
+      "output_factors": [16, 2, 2, 2, 4],
+      "tt_shape": [16, 2, 4, 4, 4, 4, 2, 2, 2, 16]
+    },
+    "o_proj": {
+      "weight_shape": [2048, 2048],
+      "input_factors": [16, 2, 4, 4, 4],
+      "output_factors": [16, 2, 4, 4, 4],
+      "tt_shape": [16, 2, 4, 4, 4, 4, 4, 4, 2, 16]
+    }
+  }
+}

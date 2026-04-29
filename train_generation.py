@@ -80,6 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
+    parser.add_argument(
+        "--generation-eval-samples",
+        type=int,
+        default=None,
+        help="Optional row-level generation-evaluation sample cap. Used for GSM8K exact-match evaluation.",
+    )
+    parser.add_argument(
+        "--generation-eval-max-new-tokens",
+        type=int,
+        default=256,
+        help="Maximum generated tokens per example for row-level generation evaluation.",
+    )
     parser.add_argument("--notes", default=None)
     return parser
 
@@ -135,6 +147,8 @@ def main() -> None:
             text_column=args.text_column,
             max_train_samples=args.max_train_samples,
             max_eval_samples=args.max_eval_samples,
+            generation_eval_samples=args.generation_eval_samples,
+            generation_eval_max_new_tokens=args.generation_eval_max_new_tokens,
         ),
         training=GenerationTrainingConfig(
             output_dir=args.output_dir,

@@ -12,7 +12,7 @@ plots/
 suites/
 *requirements.txt
 gpt2small/
-llama2-7b/
+llama*
 datasets/alpaca/
 datasets/wikitext/
 *.svg

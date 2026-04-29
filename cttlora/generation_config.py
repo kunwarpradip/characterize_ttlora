@@ -35,6 +35,8 @@ class GenerationDataConfig:
     text_column: str = "text"
     max_train_samples: int | None = None
     max_eval_samples: int | None = None
+    generation_eval_samples: int | None = None
+    generation_eval_max_new_tokens: int = 256
 
 
 @dataclass(slots=True)

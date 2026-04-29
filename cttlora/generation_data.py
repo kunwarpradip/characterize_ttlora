@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,15 @@ def _select_subset(dataset: Dataset, limit: int | None) -> Dataset:
     if limit is None or limit >= len(dataset):
         return dataset
     return dataset.select(range(limit))
+
+
+@dataclass(slots=True)
+class GenerationDataStats:
+    train_rows: int
+    validation_rows: int
+    train_blocks: int
+    validation_blocks: int
+    block_size: int
 
 
 def resolve_local_dataset_dir(data_config: GenerationDataConfig) -> Path:
@@ -62,6 +72,54 @@ def _parquet_data_files(dataset_dir: Path) -> dict[str, list[str]]:
         if split is not None:
             data_files.setdefault(split, []).append(str(path))
     return data_files
+
+
+def load_local_generation_dataset_raw(data_config: GenerationDataConfig) -> DatasetDict:
+    dataset_dir = resolve_local_dataset_dir(data_config)
+
+    if (dataset_dir / "dataset_dict.json").exists():
+        dataset = load_from_disk(str(dataset_dir))
+    else:
+        jsonl_train = dataset_dir / "cleaned_short_train_scrubbed.jsonl"
+        jsonl_valid = dataset_dir / "cleaned_short_test_scrubbed.jsonl"
+        csv_train = dataset_dir / "cleaned_short_train_scrubbed.csv"
+        csv_valid = dataset_dir / "cleaned_short_test_scrubbed.csv"
+
+        parquet_splits = _parquet_data_files(dataset_dir)
+
+        if parquet_splits:
+            dataset = load_dataset("parquet", data_files=parquet_splits)
+        elif jsonl_train.exists() and jsonl_valid.exists():
+            dataset = load_dataset(
+                "json",
+                data_files={"train": str(jsonl_train), "validation": str(jsonl_valid)},
+            )
+        elif csv_train.exists() and csv_valid.exists():
+            dataset = load_dataset(
+                "csv",
+                data_files={"train": str(csv_train), "validation": str(csv_valid)},
+            )
+        else:
+            raise FileNotFoundError(
+                f"Could not infer a local text-generation dataset layout inside {dataset_dir}"
+            )
+
+    if "validation" not in dataset and "test" in dataset:
+        dataset = DatasetDict(
+            {
+                "train": dataset[data_config.train_split],
+                "validation": dataset["test"],
+            }
+        )
+
+    if data_config.train_split not in dataset:
+        raise ValueError(f"Train split '{data_config.train_split}' not found. Available: {list(dataset.keys())}")
+    if data_config.validation_split not in dataset:
+        raise ValueError(
+            f"Validation split '{data_config.validation_split}' not found. Available: {list(dataset.keys())}"
+        )
+
+    return dataset
 
 
 def _format_generation_examples(dataset_name: str, dataset: DatasetDict) -> DatasetDict:
@@ -118,49 +176,7 @@ def _format_generation_examples(dataset_name: str, dataset: DatasetDict) -> Data
 
 
 def load_local_generation_dataset(data_config: GenerationDataConfig) -> DatasetDict:
-    dataset_dir = resolve_local_dataset_dir(data_config)
-
-    if (dataset_dir / "dataset_dict.json").exists():
-        dataset = load_from_disk(str(dataset_dir))
-    else:
-        jsonl_train = dataset_dir / "cleaned_short_train_scrubbed.jsonl"
-        jsonl_valid = dataset_dir / "cleaned_short_test_scrubbed.jsonl"
-        csv_train = dataset_dir / "cleaned_short_train_scrubbed.csv"
-        csv_valid = dataset_dir / "cleaned_short_test_scrubbed.csv"
-
-        parquet_splits = _parquet_data_files(dataset_dir)
-
-        if parquet_splits:
-            dataset = load_dataset("parquet", data_files=parquet_splits)
-        elif jsonl_train.exists() and jsonl_valid.exists():
-            dataset = load_dataset(
-                "json",
-                data_files={"train": str(jsonl_train), "validation": str(jsonl_valid)},
-            )
-        elif csv_train.exists() and csv_valid.exists():
-            dataset = load_dataset(
-                "csv",
-                data_files={"train": str(csv_train), "validation": str(csv_valid)},
-            )
-        else:
-            raise FileNotFoundError(
-                f"Could not infer a local text-generation dataset layout inside {dataset_dir}"
-            )
-
-    if "validation" not in dataset and "test" in dataset:
-        dataset = DatasetDict(
-            {
-                "train": dataset[data_config.train_split],
-                "validation": dataset["test"],
-            }
-        )
-
-    if data_config.train_split not in dataset:
-        raise ValueError(f"Train split '{data_config.train_split}' not found. Available: {list(dataset.keys())}")
-    if data_config.validation_split not in dataset:
-        raise ValueError(
-            f"Validation split '{data_config.validation_split}' not found. Available: {list(dataset.keys())}"
-        )
+    dataset = load_local_generation_dataset_raw(data_config)
 
     sample_columns = dataset[data_config.train_split].column_names
     text_column = data_config.text_column
@@ -228,6 +244,19 @@ class SentencePieceTokenizerAdapter:
             ids = ids[: self.model_max_length]
         return ids
 
+    def decode(self, token_ids, skip_special_tokens: bool = True, **_: Any) -> str:
+        ids = [int(item) for item in token_ids]
+        if skip_special_tokens:
+            special_ids = {self.bos_token_id, self.eos_token_id, self.pad_token_id}
+            ids = [item for item in ids if item not in special_ids]
+        return str(self.processor.decode(ids))
+
+    def batch_decode(self, sequences, skip_special_tokens: bool = True, **kwargs: Any) -> list[str]:
+        return [
+            self.decode(sequence, skip_special_tokens=skip_special_tokens, **kwargs)
+            for sequence in sequences
+        ]
+
     def save_pretrained(self, save_directory: str | Path) -> None:
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
@@ -251,7 +280,7 @@ def prepare_generation_data(
     batch_size: int,
     eval_batch_size: int,
     num_workers: int,
-) -> tuple[PreTrainedTokenizerBase, Dataset, Dataset, DataLoader, DataLoader]:
+) -> tuple[PreTrainedTokenizerBase, Dataset, Dataset, DataLoader, DataLoader, GenerationDataStats]:
     tokenizer = resolve_generation_tokenizer(tokenizer_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -259,6 +288,8 @@ def prepare_generation_data(
             raise ValueError("Tokenizer has no pad_token or eos_token.")
 
     dataset = load_local_generation_dataset(data_config)
+    train_rows = len(dataset[data_config.train_split])
+    validation_rows = len(dataset[data_config.validation_split])
 
     def tokenize_batch(batch: dict) -> dict:
         return tokenizer(batch["text"])
@@ -286,6 +317,13 @@ def prepare_generation_data(
     grouped = tokenized.map(group_texts, batched=True)
     train_dataset = _select_subset(grouped[data_config.train_split], data_config.max_train_samples)
     val_dataset = _select_subset(grouped[data_config.validation_split], data_config.max_eval_samples)
+    data_stats = GenerationDataStats(
+        train_rows=train_rows,
+        validation_rows=validation_rows,
+        train_blocks=len(train_dataset),
+        validation_blocks=len(val_dataset),
+        block_size=block_size,
+    )
     train_dataset.set_format("torch")
     val_dataset.set_format("torch")
 
@@ -305,4 +343,4 @@ def prepare_generation_data(
         collate_fn=default_data_collator,
         pin_memory=True,
     )
-    return tokenizer, train_dataset, val_dataset, train_loader, val_loader
+    return tokenizer, train_dataset, val_dataset, train_loader, val_loader, data_stats
