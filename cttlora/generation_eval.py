@@ -67,7 +67,7 @@ def normalize_number(value: str) -> str | None:
     except InvalidOperation:
         return None
     if number == number.to_integral_value():
-        return str(number.quantize(Decimal("1")))
+        return format(number.to_integral_value(), "f")
     return format(number.normalize(), "f").rstrip("0").rstrip(".")
 
 
@@ -93,8 +93,8 @@ def _encode_prompts(tokenizer, prompts: list[str], max_prompt_length: int, devic
     attention_mask = []
     for ids in encoded_prompts:
         pad_count = max_length - len(ids)
-        input_ids.append(ids + [int(pad_token_id)] * pad_count)
-        attention_mask.append([1] * len(ids) + [0] * pad_count)
+        input_ids.append([int(pad_token_id)] * pad_count + ids)
+        attention_mask.append([0] * pad_count + [1] * len(ids))
 
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),
@@ -102,10 +102,10 @@ def _encode_prompts(tokenizer, prompts: list[str], max_prompt_length: int, devic
     }
 
 
-def _decode_generated(tokenizer, generated_sequences: torch.Tensor, prompt_lengths: list[int]) -> list[str]:
+def _decode_generated(tokenizer, generated_sequences: torch.Tensor, prompt_width: int) -> list[str]:
     decoded: list[str] = []
-    for sequence, prompt_length in zip(generated_sequences, prompt_lengths):
-        continuation = sequence[prompt_length:].detach().cpu().tolist()
+    for sequence in generated_sequences:
+        continuation = sequence[prompt_width:].detach().cpu().tolist()
         decoded.append(tokenizer.decode(continuation, skip_special_tokens=True).strip())
     return decoded
 
@@ -158,6 +158,8 @@ def evaluate_gsm8k_exact_match(
     model_max_length = int(getattr(tokenizer, "model_max_length", data_config.max_length))
     max_prompt_length = max(1, min(data_config.max_length, model_max_length) - max_new_tokens)
     pad_token_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None)
+    if hasattr(tokenizer, "padding_side"):
+        tokenizer.padding_side = "left"
 
     records: list[GSM8KEvaluationRecord] = []
     model.eval()
@@ -183,7 +185,6 @@ def evaluate_gsm8k_exact_match(
             batch_rows = rows.select(range(start, batch_end))
             prompts = [_gsm8k_prompt(question) for question in batch_rows["question"]]
             encoded = _encode_prompts(tokenizer, prompts, max_prompt_length, device)
-            prompt_lengths = encoded["attention_mask"].sum(dim=1).detach().cpu().tolist()
             generated = model.generate(
                 **encoded,
                 max_new_tokens=max_new_tokens,
@@ -191,7 +192,7 @@ def evaluate_gsm8k_exact_match(
                 pad_token_id=pad_token_id,
                 eos_token_id=getattr(tokenizer, "eos_token_id", None),
             )
-            generated_texts = _decode_generated(tokenizer, generated, [int(item) for item in prompt_lengths])
+            generated_texts = _decode_generated(tokenizer, generated, encoded["input_ids"].shape[1])
 
             for offset, generated_text in enumerate(generated_texts):
                 row_index = start + offset
