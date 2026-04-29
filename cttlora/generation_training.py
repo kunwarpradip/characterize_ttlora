@@ -498,6 +498,8 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             [weight.weight_name for weight in config.model.weight_configs]
             if config.model.adaptation_method == "ttlora"
             else list(config.model.lora_target_weights)
+            if config.model.adaptation_method == "lora"
+            else None
         ),
         "adapt_layers": list(config.model.adapt_layers) if config.model.adapt_layers is not None else None,
         "seed": config.training.seed,
@@ -509,9 +511,9 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "max_grad_norm_threshold": config.training.max_grad_norm,
         "num_workers": config.training.num_workers,
         "summary_only": config.training.summary_only,
-        "ttlora_variant": config.model.ttlora_variant,
-        "ttlora_rank": config.model.ttlora_rank,
-        "ttlora_alpha": config.model.ttlora_alpha,
+        "ttlora_variant": config.model.ttlora_variant if config.model.adaptation_method == "ttlora" else None,
+        "ttlora_rank": config.model.ttlora_rank if config.model.adaptation_method == "ttlora" else None,
+        "ttlora_alpha": config.model.ttlora_alpha if config.model.adaptation_method == "ttlora" else None,
         "lora_rank": config.model.lora_rank if config.model.adaptation_method == "lora" else None,
         "lora_alpha": config.model.lora_alpha if config.model.adaptation_method == "lora" else None,
         "lora_target_weights": (

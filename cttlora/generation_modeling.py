@@ -378,6 +378,8 @@ def apply_generation_lora(model, model_config: GenerationModelConfig):
 
 def apply_generation_adaptation(model, model_config: GenerationModelConfig):
     method = model_config.adaptation_method.lower()
+    if method == "full":
+        return model
     if method == "ttlora":
         return apply_generation_ttlora(model, model_config)
     if method == "lora":

@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--adaptation-method",
         default="ttlora",
-        choices=("ttlora", "lora"),
+        choices=("full", "ttlora", "lora"),
         help="Generation adaptation method. Use lora for a plain LoRA baseline.",
     )
     parser.add_argument("--lora-rank", type=int, default=8)
