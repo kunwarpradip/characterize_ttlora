@@ -25,6 +25,11 @@ from .generation_modeling import load_generation_model
 from .modeling import count_parameters, parameter_groups, trainable_parameter_names
 from .training import compute_grad_norm, prepare_run_dir, resolve_device
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 @dataclass(slots=True)
 class GenerationEpochRecord:
@@ -284,7 +289,20 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         micro_token_correct = 0
         micro_token_total = 0
 
-        for step, batch in enumerate(train_loader, start=1):
+        train_iterator = enumerate(train_loader, start=1)
+        if tqdm is not None:
+            train_iterator = enumerate(
+                tqdm(
+                    train_loader,
+                    total=len(train_loader),
+                    desc=f"Epoch {epoch}/{config.training.epochs}",
+                    unit="batch",
+                    leave=False,
+                ),
+                start=1,
+            )
+
+        for step, batch in train_iterator:
             batch = {key: value.to(device) for key, value in batch.items()}
             outputs = model(**batch)
             loss = outputs.loss / max(1, config.training.gradient_accumulation_steps)

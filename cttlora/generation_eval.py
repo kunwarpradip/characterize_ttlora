@@ -13,6 +13,11 @@ from datasets import Dataset
 from .generation_config import GenerationDataConfig
 from .generation_data import load_local_generation_dataset_raw
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 @dataclass(slots=True)
 class GSM8KEvaluationRecord:
@@ -163,8 +168,17 @@ def evaluate_gsm8k_exact_match(
             max(1, batch_size),
             max_new_tokens,
         )
+    starts = range(0, len(rows), max(1, batch_size))
+    if tqdm is not None:
+        starts = tqdm(
+            starts,
+            total=(len(rows) + max(1, batch_size) - 1) // max(1, batch_size),
+            desc="GSM8K exact-match",
+            unit="batch",
+            leave=False,
+        )
     with torch.no_grad():
-        for start in range(0, len(rows), max(1, batch_size)):
+        for start in starts:
             batch_end = min(start + max(1, batch_size), len(rows))
             batch_rows = rows.select(range(start, batch_end))
             prompts = [_gsm8k_prompt(question) for question in batch_rows["question"]]
