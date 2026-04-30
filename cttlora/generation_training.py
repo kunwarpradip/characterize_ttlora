@@ -20,7 +20,12 @@ from transformers import (
 
 from .generation_config import GenerationExperimentConfig
 from .generation_data import prepare_generation_data
-from .generation_eval import evaluate_gsm8k_exact_match, is_gsm8k_dataset
+from .generation_eval import (
+    evaluate_cnn_summarization,
+    evaluate_gsm8k_exact_match,
+    is_cnn_dataset,
+    is_gsm8k_dataset,
+)
 from .generation_modeling import load_generation_model
 from .modeling import count_parameters, parameter_groups, trainable_parameter_names
 from .training import compute_grad_norm, prepare_run_dir, resolve_device
@@ -444,6 +449,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         logger.info("Wrote step history: %s", step_history_path)
 
     gsm8k_eval_summary = None
+    cnn_eval_summary = None
     if is_gsm8k_dataset(config.data.dataset_name):
         gsm8k_predictions_path = None if config.training.summary_only else run_dir / "gsm8k_predictions.csv"
         gsm8k_eval_limit = (
@@ -474,12 +480,47 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             gsm8k_eval_summary.evaluated_examples,
             gsm8k_eval_summary.predictions_path,
         )
+    elif is_cnn_dataset(config.data.dataset_name):
+        cnn_predictions_path = None if config.training.summary_only else run_dir / "cnn_predictions.csv"
+        cnn_eval_limit = (
+            config.data.generation_eval_samples
+            if config.data.generation_eval_samples is not None
+            else config.data.max_eval_samples
+        )
+        logger.info(
+            "Starting CNN/DailyMail summarization evaluation: samples=%s max_new_tokens=%d",
+            cnn_eval_limit if cnn_eval_limit is not None else "all",
+            config.data.generation_eval_max_new_tokens,
+        )
+        cnn_eval_summary = evaluate_cnn_summarization(
+            model=model,
+            tokenizer=tokenizer,
+            data_config=config.data,
+            device=device,
+            output_path=cnn_predictions_path,
+            max_eval_samples=cnn_eval_limit,
+            batch_size=config.training.eval_batch_size,
+            max_new_tokens=config.data.generation_eval_max_new_tokens,
+            logger=logger,
+        )
+        logger.info(
+            "CNN/DailyMail summarization evaluation complete: rouge1=%.4f rouge2=%.4f rougeL=%.4f meteor=%.4f predictions=%s",
+            cnn_eval_summary.rouge1,
+            cnn_eval_summary.rouge2,
+            cnn_eval_summary.rougeL,
+            cnn_eval_summary.meteor,
+            cnn_eval_summary.predictions_path,
+        )
 
     first_epoch = history[0] if history else None
     best_record = min(history, key=lambda record: record.validation_loss) if history else None
     gsm8k_accuracy = (
         gsm8k_eval_summary.exact_match_accuracy if gsm8k_eval_summary is not None else None
     )
+    cnn_rouge1 = cnn_eval_summary.rouge1 if cnn_eval_summary is not None else None
+    cnn_rouge2 = cnn_eval_summary.rouge2 if cnn_eval_summary is not None else None
+    cnn_rougeL = cnn_eval_summary.rougeL if cnn_eval_summary is not None else None
+    cnn_meteor = cnn_eval_summary.meteor if cnn_eval_summary is not None else None
     summary = {
         "dataset_name": config.data.dataset_name,
         "base_run_dir": str(base_run_dir),
@@ -553,6 +594,16 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         ),
         "gsm8k_predictions_path": (
             gsm8k_eval_summary.predictions_path if gsm8k_eval_summary is not None else None
+        ),
+        "cnn_rouge1": cnn_rouge1,
+        "cnn_rouge2": cnn_rouge2,
+        "cnn_rougeL": cnn_rougeL,
+        "cnn_meteor": cnn_meteor,
+        "cnn_evaluated_examples": (
+            cnn_eval_summary.evaluated_examples if cnn_eval_summary is not None else None
+        ),
+        "cnn_predictions_path": (
+            cnn_eval_summary.predictions_path if cnn_eval_summary is not None else None
         ),
         "final_validation_loss": history[-1].validation_loss if history else None,
         "final_validation_perplexity": history[-1].validation_perplexity if history else None,

@@ -63,6 +63,11 @@ def is_gsm8k_dataset_name(dataset_name: str) -> bool:
     return normalized == "gsm8k" or normalized.startswith("gsm8k/")
 
 
+def is_cnn_dataset_name(dataset_name: str) -> bool:
+    normalized = dataset_name.lower().replace("\\", "/")
+    return normalized.startswith("cnn") or normalized in {"cnn_dailymail", "cnn_daily_mail", "cnn/dailymail"}
+
+
 def _split_from_file_name(path: Path) -> str | None:
     name = path.name.lower()
     for split in ("train", "validation", "test"):
@@ -298,31 +303,54 @@ def _gsm8k_completion(answer: Any, eos_token: str | None) -> str:
     return completion
 
 
-def _prepare_gsm8k_prompt_completion_data(
+def _cnn_prompt(article: Any) -> str:
+    return f"Article:\n{article}\n\nSummary:\n"
+
+
+def _cnn_completion(highlights: Any, eos_token: str | None) -> str:
+    completion = str(highlights)
+    if eos_token:
+        completion = completion + eos_token
+    return completion
+
+
+def _prepare_prompt_completion_data(
     data_config: GenerationDataConfig,
     tokenizer,
     batch_size: int,
     eval_batch_size: int,
     num_workers: int,
+    prompt_builder,
+    completion_builder,
+    required_columns: tuple[str, str],
 ) -> tuple[Dataset, Dataset, DataLoader, DataLoader, GenerationDataStats]:
     raw_dataset = load_local_generation_dataset_raw(data_config)
     train_rows = len(raw_dataset[data_config.train_split])
     validation_rows = len(raw_dataset[data_config.validation_split])
     block_size = _tokenizer_max_length(tokenizer, data_config.max_length)
     eos_token = getattr(tokenizer, "eos_token", None)
+    source_column, target_column = required_columns
+
+    for split_name in (data_config.train_split, data_config.validation_split):
+        columns = set(raw_dataset[split_name].column_names)
+        if source_column not in columns or target_column not in columns:
+            raise ValueError(
+                f"prompt_completion requires columns {required_columns} for split '{split_name}', "
+                f"but found {sorted(columns)}."
+            )
 
     def encode_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
         input_ids_batch = []
         attention_mask_batch = []
         labels_batch = []
-        for question, answer in zip(batch["question"], batch["answer"]):
+        for source_text, target_text in zip(batch[source_column], batch[target_column]):
             prompt_ids = tokenizer.encode(
-                _gsm8k_prompt(question),
+                prompt_builder(source_text),
                 add_special_tokens=True,
                 truncation=False,
             )
             completion_ids = tokenizer.encode(
-                _gsm8k_completion(answer, eos_token),
+                completion_builder(target_text, eos_token),
                 add_special_tokens=False,
                 truncation=False,
             )
@@ -347,19 +375,28 @@ def _prepare_gsm8k_prompt_completion_data(
             "labels": labels_batch,
         }
 
-    encoded = DatasetDict(
+    train_split_dataset = _select_subset(raw_dataset[data_config.train_split], data_config.max_train_samples)
+    val_split_dataset = _select_subset(raw_dataset[data_config.validation_split], data_config.max_eval_samples)
+    selected_dataset = DatasetDict(
         {
-            split: raw_dataset[split].map(
-                encode_batch,
-                batched=True,
-                remove_columns=raw_dataset[split].column_names,
-            )
-            for split in raw_dataset.keys()
+            data_config.train_split: train_split_dataset,
+            data_config.validation_split: val_split_dataset,
         }
     )
 
-    train_dataset = _select_subset(encoded[data_config.train_split], data_config.max_train_samples)
-    val_dataset = _select_subset(encoded[data_config.validation_split], data_config.max_eval_samples)
+    encoded = DatasetDict(
+        {
+            split: selected_dataset[split].map(
+                encode_batch,
+                batched=True,
+                remove_columns=selected_dataset[split].column_names,
+            )
+            for split in selected_dataset.keys()
+        }
+    )
+
+    train_dataset = encoded[data_config.train_split]
+    val_dataset = encoded[data_config.validation_split]
 
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     if pad_token_id is None:
@@ -423,16 +460,31 @@ def prepare_generation_data(
             raise ValueError("Tokenizer has no pad_token or eos_token.")
 
     if data_config.training_format == "prompt_completion":
-        if not is_gsm8k_dataset_name(data_config.dataset_name):
-            raise ValueError("prompt_completion training is currently implemented for GSM8K datasets only.")
-        train_dataset, val_dataset, train_loader, val_loader, data_stats = _prepare_gsm8k_prompt_completion_data(
-            data_config=data_config,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            eval_batch_size=eval_batch_size,
-            num_workers=num_workers,
-        )
-        return tokenizer, train_dataset, val_dataset, train_loader, val_loader, data_stats
+        if is_gsm8k_dataset_name(data_config.dataset_name):
+            train_dataset, val_dataset, train_loader, val_loader, data_stats = _prepare_prompt_completion_data(
+                data_config=data_config,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+                eval_batch_size=eval_batch_size,
+                num_workers=num_workers,
+                prompt_builder=_gsm8k_prompt,
+                completion_builder=_gsm8k_completion,
+                required_columns=("question", "answer"),
+            )
+            return tokenizer, train_dataset, val_dataset, train_loader, val_loader, data_stats
+        if is_cnn_dataset_name(data_config.dataset_name):
+            train_dataset, val_dataset, train_loader, val_loader, data_stats = _prepare_prompt_completion_data(
+                data_config=data_config,
+                tokenizer=tokenizer,
+                batch_size=batch_size,
+                eval_batch_size=eval_batch_size,
+                num_workers=num_workers,
+                prompt_builder=_cnn_prompt,
+                completion_builder=_cnn_completion,
+                required_columns=("article", "highlights"),
+            )
+            return tokenizer, train_dataset, val_dataset, train_loader, val_loader, data_stats
+        raise ValueError("prompt_completion training is currently implemented for GSM8K and CNN/DailyMail datasets only.")
     if data_config.training_format != "blocks":
         raise ValueError(f"Unsupported generation training_format: {data_config.training_format}")
 
