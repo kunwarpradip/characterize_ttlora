@@ -37,6 +37,7 @@ class GenerationDataConfig:
     train_split: str = "train"
     validation_split: str = "validation"
     text_column: str = "text"
+    training_format: str = "blocks"
     max_train_samples: int | None = None
     max_eval_samples: int | None = None
     generation_eval_samples: int | None = None

@@ -17,6 +17,7 @@ PYTHON="/home/pkunwar/miniconda3/envs/characterize-ttlora/bin/python"
   --ttlora-alpha 8.0 \
   --ttlora-variant reconstruction \
   --max-length 1024 \
+  --training-format prompt_completion \
   --batch-size 1 \
   --eval-batch-size 1 \
   --gradient-accumulation-steps 16 \

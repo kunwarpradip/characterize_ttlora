@@ -14,6 +14,7 @@ PYTHON="/home/pkunwar/miniconda3/envs/characterize-ttlora/bin/python"
   --run-name "llama3_2_1b_gsm8k_full_finetune" \
   --adaptation-method full \
   --max-length 1024 \
+  --training-format prompt_completion \
   --batch-size 1 \
   --eval-batch-size 1 \
   --gradient-accumulation-steps 32 \

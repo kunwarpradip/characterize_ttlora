@@ -5,6 +5,7 @@ from itertools import chain
 from pathlib import Path
 from typing import Any
 
+import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase, default_data_collator
@@ -55,6 +56,11 @@ def resolve_local_dataset_dir(data_config: GenerationDataConfig) -> Path:
         f"Dataset directory not found for '{dataset_name}'. Checked: "
         + ", ".join(str(path) for path in candidates)
     )
+
+
+def is_gsm8k_dataset_name(dataset_name: str) -> bool:
+    normalized = dataset_name.lower().replace("\\", "/")
+    return normalized == "gsm8k" or normalized.startswith("gsm8k/")
 
 
 def _split_from_file_name(path: Path) -> str | None:
@@ -274,6 +280,135 @@ def resolve_generation_tokenizer(tokenizer_name_or_path: str):
     return AutoTokenizer.from_pretrained(tokenizer_name_or_path)
 
 
+def _tokenizer_max_length(tokenizer, configured_max_length: int) -> int:
+    model_max_length = getattr(tokenizer, "model_max_length", configured_max_length)
+    if model_max_length is None or model_max_length > 1_000_000:
+        model_max_length = configured_max_length
+    return min(configured_max_length, int(model_max_length))
+
+
+def _gsm8k_prompt(question: Any) -> str:
+    return f"Question:\n{question}\n\nAnswer:\n"
+
+
+def _gsm8k_completion(answer: Any, eos_token: str | None) -> str:
+    completion = str(answer)
+    if eos_token:
+        completion = completion + eos_token
+    return completion
+
+
+def _prepare_gsm8k_prompt_completion_data(
+    data_config: GenerationDataConfig,
+    tokenizer,
+    batch_size: int,
+    eval_batch_size: int,
+    num_workers: int,
+) -> tuple[Dataset, Dataset, DataLoader, DataLoader, GenerationDataStats]:
+    raw_dataset = load_local_generation_dataset_raw(data_config)
+    train_rows = len(raw_dataset[data_config.train_split])
+    validation_rows = len(raw_dataset[data_config.validation_split])
+    block_size = _tokenizer_max_length(tokenizer, data_config.max_length)
+    eos_token = getattr(tokenizer, "eos_token", None)
+
+    def encode_batch(batch: dict[str, list[Any]]) -> dict[str, list[list[int]]]:
+        input_ids_batch = []
+        attention_mask_batch = []
+        labels_batch = []
+        for question, answer in zip(batch["question"], batch["answer"]):
+            prompt_ids = tokenizer.encode(
+                _gsm8k_prompt(question),
+                add_special_tokens=True,
+                truncation=False,
+            )
+            completion_ids = tokenizer.encode(
+                _gsm8k_completion(answer, eos_token),
+                add_special_tokens=False,
+                truncation=False,
+            )
+
+            input_ids = [int(item) for item in prompt_ids + completion_ids]
+            labels = [-100] * len(prompt_ids) + [int(item) for item in completion_ids]
+            if len(input_ids) > block_size:
+                overflow = len(input_ids) - block_size
+                input_ids = input_ids[overflow:]
+                labels = labels[overflow:]
+                if labels and all(label == -100 for label in labels):
+                    labels[-1] = input_ids[-1]
+            attention_mask = [1] * len(input_ids)
+
+            input_ids_batch.append(input_ids)
+            attention_mask_batch.append(attention_mask)
+            labels_batch.append(labels)
+
+        return {
+            "input_ids": input_ids_batch,
+            "attention_mask": attention_mask_batch,
+            "labels": labels_batch,
+        }
+
+    encoded = DatasetDict(
+        {
+            split: raw_dataset[split].map(
+                encode_batch,
+                batched=True,
+                remove_columns=raw_dataset[split].column_names,
+            )
+            for split in raw_dataset.keys()
+        }
+    )
+
+    train_dataset = _select_subset(encoded[data_config.train_split], data_config.max_train_samples)
+    val_dataset = _select_subset(encoded[data_config.validation_split], data_config.max_eval_samples)
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None:
+        raise ValueError("Tokenizer must define pad_token_id or eos_token_id.")
+
+    def collate_prompt_completion(features: list[dict[str, list[int]]]) -> dict[str, torch.Tensor]:
+        max_length = max(len(feature["input_ids"]) for feature in features)
+        input_ids = []
+        attention_mask = []
+        labels = []
+        for feature in features:
+            pad_count = max_length - len(feature["input_ids"])
+            input_ids.append([int(pad_token_id)] * pad_count + [int(item) for item in feature["input_ids"]])
+            attention_mask.append([0] * pad_count + [int(item) for item in feature["attention_mask"]])
+            labels.append([-100] * pad_count + [int(item) for item in feature["labels"]])
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
+    data_stats = GenerationDataStats(
+        train_rows=train_rows,
+        validation_rows=validation_rows,
+        train_blocks=len(train_dataset),
+        validation_blocks=len(val_dataset),
+        block_size=block_size,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_prompt_completion,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_prompt_completion,
+        pin_memory=True,
+    )
+    return train_dataset, val_dataset, train_loader, val_loader, data_stats
+
+
 def prepare_generation_data(
     data_config: GenerationDataConfig,
     tokenizer_name_or_path: str,
@@ -286,6 +421,20 @@ def prepare_generation_data(
         tokenizer.pad_token = tokenizer.eos_token
         if tokenizer.pad_token is None:
             raise ValueError("Tokenizer has no pad_token or eos_token.")
+
+    if data_config.training_format == "prompt_completion":
+        if not is_gsm8k_dataset_name(data_config.dataset_name):
+            raise ValueError("prompt_completion training is currently implemented for GSM8K datasets only.")
+        train_dataset, val_dataset, train_loader, val_loader, data_stats = _prepare_gsm8k_prompt_completion_data(
+            data_config=data_config,
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            eval_batch_size=eval_batch_size,
+            num_workers=num_workers,
+        )
+        return tokenizer, train_dataset, val_dataset, train_loader, val_loader, data_stats
+    if data_config.training_format != "blocks":
+        raise ValueError(f"Unsupported generation training_format: {data_config.training_format}")
 
     dataset = load_local_generation_dataset(data_config)
     train_rows = len(dataset[data_config.train_split])
@@ -300,7 +449,7 @@ def prepare_generation_data(
         remove_columns=dataset[data_config.train_split].column_names,
     )
 
-    block_size = min(data_config.max_length, tokenizer.model_max_length)
+    block_size = _tokenizer_max_length(tokenizer, data_config.max_length)
 
     def group_texts(examples: dict) -> dict:
         concatenated = {key: list(chain(*examples[key])) for key in examples.keys()}

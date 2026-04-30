@@ -17,6 +17,7 @@ PYTHON="/home/pkunwar/miniconda3/envs/characterize-ttlora/bin/python"
   --lora-alpha 4.0 \
   --lora-target-weights q_proj k_proj v_proj o_proj \
   --max-length 1024 \
+  --training-format prompt_completion \
   --batch-size 1 \
   --eval-batch-size 1 \
   --gradient-accumulation-steps 16 \

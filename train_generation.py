@@ -34,6 +34,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--validation-split", default="validation")
     parser.add_argument("--text-column", default="text")
+    parser.add_argument(
+        "--training-format",
+        default="blocks",
+        choices=("blocks", "prompt_completion"),
+        help=(
+            "blocks concatenates tokenized text into LM blocks. "
+            "prompt_completion keeps rows intact and masks prompt tokens from the loss."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -173,6 +182,7 @@ def main() -> None:
             train_split=args.train_split,
             validation_split=args.validation_split,
             text_column=args.text_column,
+            training_format=args.training_format,
             max_train_samples=args.max_train_samples,
             max_eval_samples=args.max_eval_samples,
             generation_eval_samples=args.generation_eval_samples,
