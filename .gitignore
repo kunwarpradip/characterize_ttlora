@@ -18,4 +18,4 @@ datasets/wikitext/
 *.svg
 *runs_refined/
 
-phases/2.1.ttlora_core_count_study/analysis/parameter*
+phases/2.1.ttlora_core_count_study/analysis/parameter*/
