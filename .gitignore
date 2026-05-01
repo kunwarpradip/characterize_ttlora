@@ -16,5 +16,6 @@ llama*
 datasets/alpaca/
 datasets/wikitext/
 *.svg
-*.csv
 *runs_refined/
+
+phases/2.1.ttlora_core_count_study/analysis/parameter*
