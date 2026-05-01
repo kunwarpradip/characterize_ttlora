@@ -13,8 +13,31 @@ from ast import literal_eval
 
 DEFAULT_SEEDS = (647761,)
 DEFAULT_VARIANTS = ("contraction", "reconstruction")
-GENERATION_DATASETS = frozenset({"ptb", "enron"})
-GPT2_SUPPORTED_WEIGHTS = frozenset({"c_attn", "c_proj"})
+GENERATION_DATASETS = frozenset(
+    {
+        "ptb",
+        "enron",
+        "gsm8k",
+        "cnn",
+        "cnn_dailymail",
+        "cnn_daily_mail",
+        "cnn/dailymail",
+    }
+)
+GENERATION_SUPPORTED_WEIGHTS = frozenset(
+    {
+        "c_attn",
+        "c_proj",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "wq",
+        "wk",
+        "wv",
+        "wo",
+    }
+)
 
 
 def format_lr(lr: float) -> str:
@@ -187,12 +210,49 @@ def parse_generation_weight_specs(specs: list[str] | None) -> dict[str, Path]:
             )
         weight_name, csv_path = spec.split("=", 1)
         weight_name = weight_name.strip().lower()
-        if weight_name not in GPT2_SUPPORTED_WEIGHTS:
-            supported = ", ".join(sorted(GPT2_SUPPORTED_WEIGHTS))
-            raise ValueError(
-                f"Unsupported GPT-2 target weight '{weight_name}'. Supported weights: {supported}."
-            )
+        if weight_name not in GENERATION_SUPPORTED_WEIGHTS:
+            supported = ", ".join(sorted(GENERATION_SUPPORTED_WEIGHTS))
+            raise ValueError(f"Unsupported generation target weight '{weight_name}'. Supported weights: {supported}.")
         mapping[weight_name] = Path(csv_path.strip()).expanduser().resolve()
+    return mapping
+
+
+def parse_generation_combined_weight_groups(specs: list[str] | None) -> dict[str, tuple[str, ...]]:
+    if not specs:
+        return {}
+    mapping: dict[str, tuple[str, ...]] = {}
+    used_weights: set[str] = set()
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(
+                f"Invalid --generation-combined-weight-group value '{spec}'. "
+                "Expected format GROUP_LABEL=weight1,weight2,..."
+            )
+        group_label, weights_spec = spec.split("=", 1)
+        group_label = group_label.strip()
+        if not group_label:
+            raise ValueError(f"Invalid --generation-combined-weight-group value '{spec}'. Group label is empty.")
+        weights = tuple(weight.strip().lower() for weight in weights_spec.split(",") if weight.strip())
+        if not weights:
+            raise ValueError(
+                f"Invalid --generation-combined-weight-group value '{spec}'. "
+                "At least one target weight is required."
+            )
+        unsupported = [weight for weight in weights if weight not in GENERATION_SUPPORTED_WEIGHTS]
+        if unsupported:
+            supported = ", ".join(sorted(GENERATION_SUPPORTED_WEIGHTS))
+            raise ValueError(
+                f"Unsupported generation target weights {unsupported} in group '{group_label}'. "
+                f"Supported weights: {supported}."
+            )
+        overlap = sorted(set(weights).intersection(used_weights))
+        if overlap:
+            raise ValueError(
+                f"Target weights {overlap} were assigned more than once across "
+                "--generation-combined-weight-group arguments."
+            )
+        used_weights.update(weights)
+        mapping[group_label] = weights
     return mapping
 
 
@@ -238,6 +298,98 @@ def load_generation_weight_bundles(
     return bundles, metadata_sources
 
 
+def load_combined_generation_weight_bundles(
+    combined_csv_path: Path,
+    combined_weight_groups: dict[str, tuple[str, ...]],
+    core_counts: list[int] | None,
+) -> tuple[list[dict], dict[str, str]]:
+    with combined_csv_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"No rows found in {combined_csv_path}")
+
+    if not combined_weight_groups:
+        raise ValueError(
+            "Combined generation CSV support requires at least one "
+            "--generation-combined-weight-group GROUP=weight1,weight2,... argument."
+        )
+
+    metadata_sources: dict[str, str] = {}
+    bundles: list[dict] = []
+    allowed_core_counts = {int(item) for item in core_counts} if core_counts else None
+    seen_core_counts: set[int] = set()
+
+    for index, row in enumerate(rows):
+        total_cores = int(row["total_cores"])
+        if allowed_core_counts is not None and total_cores not in allowed_core_counts:
+            continue
+        if total_cores in seen_core_counts:
+            raise ValueError(
+                f"Combined CSV {combined_csv_path} contains duplicate total_cores={total_cores} rows."
+            )
+        seen_core_counts.add(total_cores)
+
+        bundle_weights: dict[str, dict] = {}
+        for group_label, target_weights in combined_weight_groups.items():
+            required_cols = (
+                f"{group_label}_tt_shape",
+                f"{group_label}_input_factors",
+                f"{group_label}_output_factors",
+                f"{group_label}_weight_shape",
+            )
+            missing = [col for col in required_cols if col not in row]
+            if missing:
+                raise ValueError(
+                    f"Combined CSV {combined_csv_path} is missing columns for group '{group_label}': {missing}"
+                )
+
+            tt_shape = parse_int_sequence(row[f"{group_label}_tt_shape"], f"{group_label}_tt_shape")
+            input_factors = parse_int_sequence(
+                row[f"{group_label}_input_factors"],
+                f"{group_label}_input_factors",
+            )
+            output_factors = parse_int_sequence(
+                row[f"{group_label}_output_factors"],
+                f"{group_label}_output_factors",
+            )
+            weight_shape = parse_int_sequence(
+                row[f"{group_label}_weight_shape"],
+                f"{group_label}_weight_shape",
+            )
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"Expected two values in {group_label}_weight_shape for total_cores={total_cores}, "
+                    f"got {list(weight_shape)}"
+                )
+
+            source_csv = row.get(f"{group_label}_source_csv", "") or str(combined_csv_path)
+            for weight_name in target_weights:
+                bundle_weights[weight_name] = {
+                    "total_cores": total_cores,
+                    "input_cores": int(row.get(f"{group_label}_input_cores") or len(input_factors)),
+                    "output_cores": int(row.get(f"{group_label}_output_cores") or len(output_factors)),
+                    "input_factors": input_factors,
+                    "output_factors": output_factors,
+                    "tt_shape": tt_shape,
+                    "weight_shape": tuple(int(item) for item in weight_shape),
+                }
+                metadata_sources[weight_name] = source_csv
+
+        bundles.append({"total_cores": total_cores, "weights": bundle_weights})
+
+    if allowed_core_counts is not None:
+        missing_core_counts = sorted(allowed_core_counts.difference(seen_core_counts))
+        if missing_core_counts:
+            raise ValueError(
+                f"Combined CSV {combined_csv_path} does not contain requested core counts: {missing_core_counts}"
+            )
+    if not bundles:
+        raise ValueError(f"No TT-shape candidates found in combined CSV {combined_csv_path}")
+
+    bundles.sort(key=lambda item: int(item["total_cores"]))
+    return bundles, metadata_sources
+
+
 def build_parser() -> argparse.ArgumentParser:
     phase_root = Path(__file__).resolve().parents[1]
     project_root = phase_root.parents[1]
@@ -280,6 +432,24 @@ def build_parser() -> argparse.ArgumentParser:
             "Repeatable mapping from GPT-2 weight name to the CSV containing lowest-parameter TT shapes, "
             "e.g. --generation-weight-spec c_attn=/path/to/c_attn.csv "
             "--generation-weight-spec c_proj=/path/to/c_proj.csv"
+        ),
+    )
+    parser.add_argument(
+        "--generation-combined-shape-csv",
+        default=None,
+        help=(
+            "Path to a combined lowest-parameter CSV produced by the notebook, where each row already "
+            "contains grouped TT shapes such as kv_* and qo_* columns."
+        ),
+    )
+    parser.add_argument(
+        "--generation-combined-weight-group",
+        action="append",
+        default=None,
+        help=(
+            "Repeatable mapping from a combined CSV group label to concrete target weights, "
+            "e.g. --generation-combined-weight-group kv=k_proj,v_proj "
+            "--generation-combined-weight-group qo=q_proj,o_proj"
         ),
     )
 
@@ -342,6 +512,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=1024,
         help="Sequence length to use for GPT-2 generation datasets.",
     )
+    parser.add_argument(
+        "--generation-training-format",
+        default="blocks",
+        choices=("blocks", "prompt_completion"),
+        help="Generation data layout to pass to train_generation.py.",
+    )
+    parser.add_argument(
+        "--generation-eval-max-new-tokens",
+        type=int,
+        default=256,
+        help="Row-level generation evaluation length to pass to train_generation.py.",
+    )
 
     parser.add_argument("--target-modules", nargs="+", default=("key", "query", "value"))
     parser.add_argument(
@@ -400,11 +582,29 @@ def main() -> None:
     has_classification_dataset = any(task == "classification" for task in dataset_task_types.values())
     resolved_adapt_layers = normalize_user_layer_indices(args.adapt_layers)
     generation_weight_csvs = parse_generation_weight_specs(args.generation_weight_spec)
-    generation_weight_bundles, generation_weight_sources = load_generation_weight_bundles(
-        generation_weight_csvs,
-        args.ttlora_rank,
-        args.core_counts,
+    generation_combined_weight_groups = parse_generation_combined_weight_groups(
+        args.generation_combined_weight_group
     )
+    if args.generation_combined_shape_csv and generation_weight_csvs:
+        raise ValueError(
+            "Use either --generation-weight-spec or --generation-combined-shape-csv, not both."
+        )
+    if generation_combined_weight_groups and not args.generation_combined_shape_csv:
+        raise ValueError(
+            "--generation-combined-weight-group requires --generation-combined-shape-csv."
+        )
+    if args.generation_combined_shape_csv:
+        generation_weight_bundles, generation_weight_sources = load_combined_generation_weight_bundles(
+            Path(args.generation_combined_shape_csv).expanduser().resolve(),
+            generation_combined_weight_groups,
+            args.core_counts,
+        )
+    else:
+        generation_weight_bundles, generation_weight_sources = load_generation_weight_bundles(
+            generation_weight_csvs,
+            args.ttlora_rank,
+            args.core_counts,
+        )
 
     shape_source_path: Path | None = None
     candidates: list[dict] = []
@@ -604,6 +804,8 @@ def main() -> None:
                             run_name,
                             "--max-length",
                             str(args.generation_max_length),
+                            "--training-format",
+                            args.generation_training_format,
                             "--epochs",
                             str(args.epochs),
                             "--batch-size",
@@ -634,6 +836,8 @@ def main() -> None:
                             str(args.log_every_steps),
                             "--step-metrics-every",
                             str(args.step_metrics_every),
+                            "--generation-eval-max-new-tokens",
+                            str(args.generation_eval_max_new_tokens),
                             "--ttlora-rank",
                             str(args.ttlora_rank),
                             "--ttlora-alpha",
@@ -701,6 +905,16 @@ def main() -> None:
         "generation_model_path": args.generation_model_path,
         "generation_train_script": args.generation_train_script,
         "generation_weight_sources": generation_weight_sources if generation_weight_sources else None,
+        "generation_combined_shape_csv": (
+            str(Path(args.generation_combined_shape_csv).expanduser().resolve())
+            if args.generation_combined_shape_csv
+            else None
+        ),
+        "generation_combined_weight_groups": (
+            {key: list(value) for key, value in generation_combined_weight_groups.items()}
+            if generation_combined_weight_groups
+            else None
+        ),
         "target_modules": list(args.target_modules),
         "adapt_layers_user": list(args.adapt_layers) if args.adapt_layers else None,
         "adapt_layers_zero_based": list(resolved_adapt_layers) if resolved_adapt_layers else None,
@@ -723,6 +937,8 @@ def main() -> None:
         "log_every_steps": args.log_every_steps,
         "step_metrics_every": args.step_metrics_every,
         "weight_shape": list(args.weight_shape) if args.weight_shape else None,
+        "generation_training_format": args.generation_training_format,
+        "generation_eval_max_new_tokens": args.generation_eval_max_new_tokens,
         "summary_only": args.summary_only,
         "runs_root": str(runs_root),
         "num_runs": len(run_specs),
