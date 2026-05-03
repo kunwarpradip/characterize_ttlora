@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -180,6 +181,48 @@ def read_summary(spec: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
         return summary_path, json.loads(summary_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return summary_path, {}
+
+
+_EPOCH_SUMMARY_RE = re.compile(r"\[epoch\s+\d+\]")
+_SAVE_BEST_RE = re.compile(r"Saved new best checkpoint:")
+
+
+def generation_run_has_resume_artifacts(spec: dict[str, Any]) -> bool:
+    run_dir = Path(spec["dataset_runs_root"]) / spec["run_name"]
+    checkpoint_dir = run_dir / "checkpoints" / "best"
+    if not checkpoint_dir.exists():
+        return False
+
+    summary_path = run_dir / "summary.json"
+    if summary_path.exists():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            summary = {}
+        best_epoch = summary.get("best_epoch")
+        if best_epoch is not None:
+            return True
+
+    history_path = run_dir / "history.csv"
+    if history_path.exists():
+        try:
+            with history_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except OSError:
+            rows = []
+        if rows:
+            return True
+
+    log_path = run_dir / "training.log"
+    if log_path.exists():
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        if _EPOCH_SUMMARY_RE.search(text) or _SAVE_BEST_RE.search(text):
+            return True
+
+    return False
 
 
 def build_result_row(
@@ -401,9 +444,17 @@ def main() -> None:
             print(f"[resume-summary] Skipping run with existing summary {spec['run_name']}", flush=True)
             continue
         spec = dict(spec)
-        should_resume_generation = (
-            args.resume_generation_from_last_epoch and str(spec.get("task_type")) == "generation"
-        )
+        should_resume_generation = False
+        if args.resume_generation_from_last_epoch and str(spec.get("task_type")) == "generation":
+            should_resume_generation = generation_run_has_resume_artifacts(spec)
+            if should_resume_generation:
+                print(f"[resume-epoch] Resuming generation run {spec['run_name']}", flush=True)
+            else:
+                print(
+                    f"[resume-epoch] No resumable checkpoint/epoch metadata for {spec['run_name']}; "
+                    "submitting as a fresh rerun.",
+                    flush=True,
+                )
         spec["ray_command"] = sanitize_command_for_ray(
             list(spec["command"]),
             python_bin_override=args.python_bin_override,
