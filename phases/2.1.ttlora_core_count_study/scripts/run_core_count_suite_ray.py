@@ -84,6 +84,7 @@ def sanitize_command_for_ray(
     command: list[str],
     python_bin_override: str | None = None,
     path_prefix_mappings: list[tuple[str, str]] | None = None,
+    resume_generation_from_last_epoch: bool = False,
 ) -> list[str]:
     sanitized: list[str] = []
     skip_next = False
@@ -100,6 +101,8 @@ def sanitize_command_for_ray(
         sanitized = [rewrite_path_token(token, mappings) for token in sanitized]
     if python_bin_override:
         sanitized[0] = python_bin_override
+    if resume_generation_from_last_epoch and "--resume-from-last-epoch" not in sanitized:
+        sanitized.append("--resume-from-last-epoch")
     sanitized.extend(["--device", "cuda"])
     return sanitized
 
@@ -340,6 +343,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Use this when the manifest was generated on another machine."
         ),
     )
+    parser.add_argument(
+        "--resume-generation-from-last-epoch",
+        action="store_true",
+        help=(
+            "Append --resume-from-last-epoch to generation training commands before submitting them to Ray. "
+            "Useful for rerunning interrupted generation runs that already saved a best checkpoint."
+        ),
+    )
     return parser
 
 
@@ -390,10 +401,14 @@ def main() -> None:
             print(f"[resume-summary] Skipping run with existing summary {spec['run_name']}", flush=True)
             continue
         spec = dict(spec)
+        should_resume_generation = (
+            args.resume_generation_from_last_epoch and str(spec.get("task_type")) == "generation"
+        )
         spec["ray_command"] = sanitize_command_for_ray(
             list(spec["command"]),
             python_bin_override=args.python_bin_override,
             path_prefix_mappings=path_prefix_mappings,
+            resume_generation_from_last_epoch=should_resume_generation,
         )
         spec["ray_cwd"] = sanitize_cwd_for_ray(spec.get("cwd"), path_prefix_mappings=path_prefix_mappings)
         filtered_specs.append(spec)

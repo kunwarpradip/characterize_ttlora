@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import random
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -26,7 +27,7 @@ from .generation_eval import (
     is_cnn_dataset,
     is_gsm8k_dataset,
 )
-from .generation_modeling import load_generation_model
+from .generation_modeling import load_generation_checkpoint_into_model, load_generation_model
 from .modeling import count_parameters, parameter_groups, trainable_parameter_names
 from .training import compute_grad_norm, prepare_run_dir, resolve_device
 
@@ -108,6 +109,13 @@ def _save_json(path: Path, payload: dict) -> None:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
+def _prepare_generation_run_dir(base_run_dir: Path, overwrite: bool, resume: bool) -> Path:
+    if resume:
+        base_run_dir.mkdir(parents=True, exist_ok=True)
+        return base_run_dir
+    return prepare_run_dir(base_run_dir, overwrite)
+
+
 def _setup_run_logger(run_dir: Path) -> tuple[logging.Logger, Path]:
     log_path = run_dir / "training.log"
     logger_name = f"cttlora.generation.{run_dir.resolve()}"
@@ -128,6 +136,155 @@ def _setup_run_logger(run_dir: Path) -> tuple[logging.Logger, Path]:
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     return logger, log_path
+
+
+def _load_epoch_history_from_csv(path: Path) -> list[GenerationEpochRecord]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    records: list[GenerationEpochRecord] = []
+    for row in rows:
+        records.append(
+            GenerationEpochRecord(
+                epoch=int(row["epoch"]),
+                train_loss=float(row["train_loss"]),
+                train_token_accuracy=float(row["train_token_accuracy"]),
+                validation_loss=float(row["validation_loss"]),
+                validation_perplexity=float(row["validation_perplexity"]),
+                validation_token_accuracy=float(row["validation_token_accuracy"]),
+                avg_grad_norm=float(row["avg_grad_norm"]),
+                max_grad_norm=float(row["max_grad_norm"]),
+                min_grad_norm=float(row["min_grad_norm"]),
+                clipped_step_fraction=float(row["clipped_step_fraction"]),
+                clipped_steps=int(row["clipped_steps"]),
+                learning_rate=float(row["learning_rate"]),
+                epoch_seconds=float(row["epoch_seconds"]),
+                peak_memory_gb=float(row["peak_memory_gb"]),
+                validation_improved=str(row["validation_improved"]).strip().lower() == "true",
+                best_validation_loss_so_far=float(row["best_validation_loss_so_far"]),
+                epochs_since_improvement=int(row["epochs_since_improvement"]),
+            )
+        )
+    return records
+
+
+def _load_step_history_from_csv(path: Path) -> list[GenerationStepRecord]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    records: list[GenerationStepRecord] = []
+    for row in rows:
+        records.append(
+            GenerationStepRecord(
+                epoch=int(row["epoch"]),
+                optimizer_step=int(row["optimizer_step"]),
+                optimizer_step_in_epoch=int(row["optimizer_step_in_epoch"]),
+                micro_step_end=int(row["micro_step_end"]),
+                train_loss=float(row["train_loss"]),
+                train_token_accuracy=float(row["train_token_accuracy"]),
+                grad_norm_pre_clip=float(row["grad_norm_pre_clip"]),
+                clipping_triggered=str(row["clipping_triggered"]).strip().lower() == "true",
+                learning_rate=float(row["learning_rate"]),
+                examples_seen_epoch=int(row["examples_seen_epoch"]),
+                elapsed_seconds=float(row["elapsed_seconds"]),
+            )
+        )
+    return records
+
+
+_EPOCH_SUMMARY_RE = re.compile(
+    r"\[epoch (?P<epoch>\d+)\] "
+    r"train_loss=(?P<train_loss>[-+0-9.eE]+) "
+    r"train_tok_acc=(?P<train_tok_acc>[-+0-9.eE]+) "
+    r"val_loss=(?P<val_loss>[-+0-9.eE]+) "
+    r"val_ppl=(?P<val_ppl>[-+0-9.eE]+) "
+    r"val_tok_acc=(?P<val_tok_acc>[-+0-9.eE]+) "
+    r"peak_mem_gb=(?P<peak_mem_gb>[-+0-9.eE]+) "
+    r"improved=(?P<improved>True|False)"
+)
+
+
+def _load_epoch_history_from_log(path: Path) -> list[GenerationEpochRecord]:
+    if not path.exists():
+        return []
+    records: list[GenerationEpochRecord] = []
+    best_val_loss = float("inf")
+    stale_epochs = 0
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = _EPOCH_SUMMARY_RE.search(raw_line)
+        if not match:
+            continue
+        epoch = int(match.group("epoch"))
+        val_loss = float(match.group("val_loss"))
+        improved = match.group("improved") == "True"
+        if improved:
+            best_val_loss = val_loss
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        records.append(
+            GenerationEpochRecord(
+                epoch=epoch,
+                train_loss=float(match.group("train_loss")),
+                train_token_accuracy=float(match.group("train_tok_acc")),
+                validation_loss=val_loss,
+                validation_perplexity=float(match.group("val_ppl")),
+                validation_token_accuracy=float(match.group("val_tok_acc")),
+                avg_grad_norm=0.0,
+                max_grad_norm=0.0,
+                min_grad_norm=0.0,
+                clipped_step_fraction=0.0,
+                clipped_steps=0,
+                learning_rate=0.0,
+                epoch_seconds=0.0,
+                peak_memory_gb=float(match.group("peak_mem_gb")),
+                validation_improved=improved,
+                best_validation_loss_so_far=best_val_loss,
+                epochs_since_improvement=stale_epochs,
+            )
+        )
+    return records
+
+
+def _find_resume_epoch(run_dir: Path) -> int | None:
+    summary_path = run_dir / "summary.json"
+    if summary_path.exists():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            best_epoch = summary.get("best_epoch")
+            if best_epoch is not None:
+                return int(best_epoch)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    history_path = run_dir / "history.csv"
+    history = _load_epoch_history_from_csv(history_path)
+    improved_epochs = [record.epoch for record in history if record.validation_improved]
+    if improved_epochs:
+        return max(improved_epochs)
+
+    log_path = run_dir / "training.log"
+    history_from_log = _load_epoch_history_from_log(log_path)
+    improved_epochs = [record.epoch for record in history_from_log if record.validation_improved]
+    if improved_epochs:
+        return max(improved_epochs)
+    return None
+
+
+def _load_resume_histories(run_dir: Path, resume_epoch: int) -> tuple[list[GenerationEpochRecord], list[GenerationStepRecord]]:
+    history_path = run_dir / "history.csv"
+    step_history_path = run_dir / "step_history.csv"
+
+    history = _load_epoch_history_from_csv(history_path)
+    if not history:
+        history = _load_epoch_history_from_log(run_dir / "training.log")
+    history = [record for record in history if record.epoch <= resume_epoch]
+
+    step_history = _load_step_history_from_csv(step_history_path)
+    step_history = [record for record in step_history if record.epoch <= resume_epoch]
+    return history, step_history
 
 
 def _safe_perplexity(loss_value: float) -> float:
@@ -193,9 +350,28 @@ def evaluate_generation(model, dataloader, device: torch.device) -> tuple[float,
 def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
     seed_everything(config.training.seed)
     base_run_dir = config.run_dir()
-    run_dir = prepare_run_dir(base_run_dir, config.training.overwrite_run_dir)
+    run_dir = _prepare_generation_run_dir(
+        base_run_dir,
+        config.training.overwrite_run_dir,
+        config.training.resume_from_last_epoch,
+    )
     checkpoints_dir = run_dir / "checkpoints" / "best"
     logger, log_path = _setup_run_logger(run_dir)
+
+    resume_epoch = None
+    history: list[GenerationEpochRecord] = []
+    step_history: list[GenerationStepRecord] = []
+    if config.training.resume_from_last_epoch:
+        resume_epoch = _find_resume_epoch(run_dir)
+        if resume_epoch is None:
+            raise ValueError(
+                f"--resume-from-last-epoch was requested, but no saved best epoch could be inferred in {run_dir}."
+            )
+        if not checkpoints_dir.exists():
+            raise FileNotFoundError(
+                f"--resume-from-last-epoch was requested, but best checkpoint directory does not exist: {checkpoints_dir}"
+            )
+        history, step_history = _load_resume_histories(run_dir, resume_epoch)
 
     logger.info("Starting generation TT-LoRA run")
     logger.info("Run directory: %s", run_dir)
@@ -238,6 +414,20 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         type(tokenizer).__name__,
     )
     model = load_generation_model(config.model)
+    if config.training.resume_from_last_epoch:
+        missing_keys, unexpected_keys = load_generation_checkpoint_into_model(model, checkpoints_dir)
+        if missing_keys or unexpected_keys:
+            logger.warning(
+                "Checkpoint load was non-exact. missing=%s unexpected=%s",
+                missing_keys[:20],
+                unexpected_keys[:20],
+            )
+        logger.info(
+            "Resuming from best checkpoint: %s (saved_epoch=%d next_epoch=%d)",
+            checkpoints_dir,
+            resume_epoch,
+            resume_epoch + 1,
+        )
     parameter_stats = count_parameters(model)
     logger.info("Loaded model: %s", type(model).__name__)
     logger.info("Parameter stats: %s", parameter_stats)
@@ -267,19 +457,31 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         type(scheduler).__name__ if scheduler is not None else "none",
     )
 
-    best_val_loss = float("inf")
-    best_epoch = 0
-    last_improvement_epoch = 0
-    stale_epochs = 0
-    history: list[GenerationEpochRecord] = []
-    step_history: list[GenerationStepRecord] = []
-    global_optimizer_step = 0
+    if history:
+        best_record = min(history, key=lambda record: record.validation_loss)
+        best_val_loss = best_record.validation_loss
+        best_epoch = best_record.epoch
+        last_improvement_epoch = best_epoch
+        stale_epochs = history[-1].epochs_since_improvement
+    else:
+        best_val_loss = float("inf")
+        best_epoch = 0
+        last_improvement_epoch = 0
+        stale_epochs = 0
+    global_optimizer_step = step_history[-1].optimizer_step if step_history else 0
 
     if not config.training.summary_only:
         _save_json(run_dir / "config.json", config.to_dict())
         logger.info("Wrote config.json")
 
-    for epoch in range(1, config.training.epochs + 1):
+    start_epoch = (resume_epoch + 1) if resume_epoch is not None else 1
+    if start_epoch > config.training.epochs:
+        logger.info(
+            "Resume target is already at or beyond requested epochs: saved_epoch=%d requested_epochs=%d",
+            resume_epoch,
+            config.training.epochs,
+        )
+    for epoch in range(start_epoch, config.training.epochs + 1):
         model.train()
         start_time = time.time()
         optimizer.zero_grad(set_to_none=True)
@@ -421,6 +623,10 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             f"peak_mem_gb={peak_memory_gb:.2f} improved={validation_improved}"
         )
 
+        if not config.training.summary_only:
+            _write_history_csv(run_dir / "history.csv", history)
+            _write_step_history_csv(run_dir / "step_history.csv", step_history)
+
         if validation_improved:
             best_val_loss = val_loss
             best_epoch = epoch
@@ -552,6 +758,9 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "max_grad_norm_threshold": config.training.max_grad_norm,
         "num_workers": config.training.num_workers,
         "summary_only": config.training.summary_only,
+        "resumed_from_last_epoch": config.training.resume_from_last_epoch,
+        "resume_checkpoint_epoch": resume_epoch,
+        "resume_start_epoch": start_epoch if config.training.resume_from_last_epoch else None,
         "ttlora_variant": config.model.ttlora_variant if config.model.adaptation_method == "ttlora" else None,
         "ttlora_rank": config.model.ttlora_rank if config.model.adaptation_method == "ttlora" else None,
         "ttlora_alpha": config.model.ttlora_alpha if config.model.adaptation_method == "ttlora" else None,

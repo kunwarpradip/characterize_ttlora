@@ -25,6 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--overwrite-run-dir", action="store_true")
     parser.add_argument(
+        "--resume-from-last-epoch",
+        action="store_true",
+        help=(
+            "Resume a generation run from the saved best checkpoint under the same run directory, "
+            "continuing from the epoch after that checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--summary-only",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -192,6 +200,7 @@ def main() -> None:
             output_dir=args.output_dir,
             run_name=run_name,
             overwrite_run_dir=args.overwrite_run_dir,
+            resume_from_last_epoch=args.resume_from_last_epoch,
             summary_only=args.summary_only,
             batch_size=args.batch_size,
             eval_batch_size=args.eval_batch_size,

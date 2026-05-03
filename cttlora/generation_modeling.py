@@ -398,3 +398,24 @@ def load_generation_model(model_config: GenerationModelConfig):
             eos_token_id = eos_token_id[0]
         model.config.pad_token_id = eos_token_id
     return apply_generation_adaptation(model, model_config)
+
+
+def load_generation_checkpoint_into_model(model: nn.Module, checkpoint_dir: str | Path) -> tuple[list[str], list[str]]:
+    checkpoint_path = Path(checkpoint_dir).expanduser().resolve()
+    safetensors_path = checkpoint_path / "model.safetensors"
+    pytorch_bin_path = checkpoint_path / "pytorch_model.bin"
+
+    state_dict = None
+    if safetensors_path.exists():
+        from safetensors.torch import load_file
+
+        state_dict = load_file(str(safetensors_path))
+    elif pytorch_bin_path.exists():
+        state_dict = torch.load(str(pytorch_bin_path), map_location="cpu")
+    else:
+        raise FileNotFoundError(
+            f"Could not find model.safetensors or pytorch_model.bin under checkpoint directory {checkpoint_path}"
+        )
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    return list(missing), list(unexpected)

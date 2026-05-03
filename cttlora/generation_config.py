@@ -49,6 +49,7 @@ class GenerationTrainingConfig:
     output_dir: str = "runs"
     run_name: str = "generation"
     overwrite_run_dir: bool = False
+    resume_from_last_epoch: bool = False
     summary_only: bool = False
     batch_size: int = 8
     eval_batch_size: int = 8
