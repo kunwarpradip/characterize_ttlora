@@ -204,6 +204,7 @@ _EPOCH_SUMMARY_RE = re.compile(
     r"peak_mem_gb=(?P<peak_mem_gb>[-+0-9.eE]+) "
     r"improved=(?P<improved>True|False)"
 )
+_SAVE_BEST_RE = re.compile(r"Saved new best checkpoint:")
 
 
 def _load_epoch_history_from_log(path: Path) -> list[GenerationEpochRecord]:
@@ -248,6 +249,47 @@ def _load_epoch_history_from_log(path: Path) -> list[GenerationEpochRecord]:
     return records
 
 
+def _find_best_epoch_from_history(history: list[GenerationEpochRecord]) -> int | None:
+    if not history:
+        return None
+    improved_epochs = [record.epoch for record in history if record.validation_improved]
+    if improved_epochs:
+        return max(improved_epochs)
+
+    best_epoch = None
+    best_so_far = float("inf")
+    for record in history:
+        if record.best_validation_loss_so_far < best_so_far:
+            best_so_far = record.best_validation_loss_so_far
+            best_epoch = record.epoch
+    if best_epoch is not None:
+        return best_epoch
+
+    best_record = min(history, key=lambda record: record.validation_loss, default=None)
+    return best_record.epoch if best_record is not None else None
+
+
+def _find_best_epoch_from_log(path: Path) -> int | None:
+    if not path.exists():
+        return None
+
+    last_completed_epoch: int | None = None
+    best_epoch_from_improved: int | None = None
+    best_epoch_from_save: int | None = None
+
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = _EPOCH_SUMMARY_RE.search(raw_line)
+        if match:
+            last_completed_epoch = int(match.group("epoch"))
+            if match.group("improved") == "True":
+                best_epoch_from_improved = last_completed_epoch
+            continue
+        if _SAVE_BEST_RE.search(raw_line) and last_completed_epoch is not None:
+            best_epoch_from_save = last_completed_epoch
+
+    return best_epoch_from_improved or best_epoch_from_save
+
+
 def _find_resume_epoch(run_dir: Path) -> int | None:
     summary_path = run_dir / "summary.json"
     if summary_path.exists():
@@ -261,15 +303,19 @@ def _find_resume_epoch(run_dir: Path) -> int | None:
 
     history_path = run_dir / "history.csv"
     history = _load_epoch_history_from_csv(history_path)
-    improved_epochs = [record.epoch for record in history if record.validation_improved]
-    if improved_epochs:
-        return max(improved_epochs)
+    best_epoch = _find_best_epoch_from_history(history)
+    if best_epoch is not None:
+        return best_epoch
 
     log_path = run_dir / "training.log"
     history_from_log = _load_epoch_history_from_log(log_path)
-    improved_epochs = [record.epoch for record in history_from_log if record.validation_improved]
-    if improved_epochs:
-        return max(improved_epochs)
+    best_epoch = _find_best_epoch_from_history(history_from_log)
+    if best_epoch is not None:
+        return best_epoch
+
+    best_epoch = _find_best_epoch_from_log(log_path)
+    if best_epoch is not None:
+        return best_epoch
     return None
 
 
