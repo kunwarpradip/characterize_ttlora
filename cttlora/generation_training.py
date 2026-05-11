@@ -29,7 +29,14 @@ from .generation_eval import (
 )
 from .generation_modeling import load_generation_checkpoint_into_model, load_generation_model
 from .modeling import count_parameters, parameter_groups, trainable_parameter_names
-from .training import compute_grad_norm, prepare_run_dir, resolve_device
+from .training import (
+    compute_grad_norm,
+    compute_ttlora_core_grad_norms,
+    finalize_named_grad_norm_stats,
+    prepare_run_dir,
+    resolve_device,
+    update_named_grad_norm_stats,
+)
 
 try:
     from tqdm.auto import tqdm
@@ -84,6 +91,7 @@ class GenerationStepRecord:
     learning_rate: float
     examples_seen_epoch: int
     elapsed_seconds: float
+    tt_core_grad_norms_json: str | None = None
 
 
 def _unwrap_private_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -213,6 +221,7 @@ def _load_step_history_from_csv(path: Path) -> list[GenerationStepRecord]:
                 learning_rate=float(row["learning_rate"]),
                 examples_seen_epoch=int(row["examples_seen_epoch"]),
                 elapsed_seconds=float(row["elapsed_seconds"]),
+                tt_core_grad_norms_json=row.get("tt_core_grad_norms_json") or None,
             )
         )
     return records
@@ -357,6 +366,29 @@ def _load_resume_histories(run_dir: Path, resume_epoch: int) -> tuple[list[Gener
     return history, step_history
 
 
+def _rehydrate_tt_core_grad_norm_stats(
+    step_history: list[GenerationStepRecord],
+) -> dict[str, dict[str, float]]:
+    stats: dict[str, dict[str, float]] = {}
+    for record in step_history:
+        if not record.tt_core_grad_norms_json:
+            continue
+        try:
+            parsed = json.loads(record.tt_core_grad_norms_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        normalized = {}
+        for name, value in parsed.items():
+            try:
+                normalized[str(name)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        update_named_grad_norm_stats(stats, normalized)
+    return stats
+
+
 def _safe_perplexity(loss_value: float) -> float:
     return float(math.exp(min(loss_value, 20.0)))
 
@@ -422,15 +454,6 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         raise ValueError(
             "DP generation training does not yet support resume-from-last-epoch because Opacus optimizer/accountant state is not persisted."
         )
-    if (
-        config.training.dp_enabled
-        and config.model.adaptation_method == "ttlora"
-        and config.model.ttlora_variant.lower() != "contraction"
-    ):
-        raise ValueError(
-            "DP TT-LoRA currently supports contraction mode only. "
-            "Reconstruction mode needs a dedicated per-sample gradient implementation."
-        )
 
     seed_everything(config.training.seed)
     base_run_dir = config.run_dir()
@@ -445,6 +468,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
     resume_epoch = None
     history: list[GenerationEpochRecord] = []
     step_history: list[GenerationStepRecord] = []
+    tt_core_grad_norm_stats: dict[str, dict[str, float]] = {}
     if config.training.resume_from_last_epoch:
         resume_epoch = _find_resume_epoch(run_dir)
         if resume_epoch is None:
@@ -456,6 +480,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 f"--resume-from-last-epoch was requested, but best checkpoint directory does not exist: {checkpoints_dir}"
             )
         history, step_history = _load_resume_histories(run_dir, resume_epoch)
+        tt_core_grad_norm_stats = _rehydrate_tt_core_grad_norm_stats(step_history)
 
     logger.info("Starting generation TT-LoRA run")
     logger.info("Run directory: %s", run_dir)
@@ -675,6 +700,8 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             )
             if should_step:
                 grad_norm = compute_grad_norm(model)
+                tt_core_grad_norms = compute_ttlora_core_grad_norms(model)
+                update_named_grad_norm_stats(tt_core_grad_norm_stats, tt_core_grad_norms)
                 grad_norm_max = max(grad_norm_max, grad_norm)
                 grad_norm_min = min(grad_norm_min, grad_norm)
                 clip_threshold = (
@@ -712,6 +739,9 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                             learning_rate=current_lr,
                             examples_seen_epoch=running_examples,
                             elapsed_seconds=time.time() - start_time,
+                            tt_core_grad_norms_json=(
+                                json.dumps(tt_core_grad_norms, sort_keys=True) if tt_core_grad_norms else None
+                            ),
                         )
                     )
                 micro_loss_sum = 0.0
@@ -999,6 +1029,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         ),
         "total_clipped_steps": sum(record.clipped_steps for record in history),
         "step_metrics_logged": len(step_history),
+        "tt_core_grad_norm_stats": finalize_named_grad_norm_stats(tt_core_grad_norm_stats),
         "history_path": str(history_path) if not config.training.summary_only else None,
         "step_history_path": str(step_history_path) if not config.training.summary_only else None,
         "best_checkpoint_dir": str(checkpoints_dir) if not config.training.summary_only else None,

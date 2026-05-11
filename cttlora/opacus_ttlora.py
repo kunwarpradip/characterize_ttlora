@@ -3,7 +3,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .adapters import TTLoRALinearWrapper, TTLoRALinearWrapperContraction, capture_tt_contraction_activations
+from .adapters import (
+    TTLoRALinearWrapper,
+    TTLoRALinearWrapperContraction,
+    capture_tt_contraction_activations,
+    reconstruct_tt_weight_matrix,
+)
 from .generation_modeling import TTLoRAGenerationWrapper
 
 try:
@@ -95,6 +100,53 @@ def _tt_contraction_grad_samples(
     return grad_samples
 
 
+def _dense_tt_update_grad_sample(
+    x_flat: torch.Tensor,
+    d_y: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    if x_flat.dim() == 2:
+        x_flat = x_flat.unsqueeze(1)
+    if d_y.dim() == 2:
+        d_y = d_y.unsqueeze(1)
+    return alpha * torch.bmm(d_y.permute(0, 2, 1), x_flat)
+
+
+def _tt_reconstruction_grad_samples(
+    module: nn.Module,
+    x_flat: torch.Tensor,
+    d_y: torch.Tensor,
+) -> dict[nn.Parameter, torch.Tensor]:
+    grad_samples: dict[nn.Parameter, torch.Tensor] = {}
+    grad_samples.update(_maybe_compute_linear_grad_sample(module.original, x_flat, d_y))
+
+    grad_dense = _dense_tt_update_grad_sample(x_flat=x_flat, d_y=d_y, alpha=module.alpha).detach()
+    tt_cores = list(module.tt_cores)
+    per_core_samples: list[list[torch.Tensor]] = [[] for _ in tt_cores]
+
+    with torch.enable_grad():
+        dense_update = reconstruct_tt_weight_matrix(
+            tt_cores=module.tt_cores,
+            input_factors=module.input_factors,
+            output_factors=module.output_factors,
+        )
+        for sample_idx in range(grad_dense.size(0)):
+            scalar_objective = (dense_update * grad_dense[sample_idx]).sum()
+            core_grads = torch.autograd.grad(
+                scalar_objective,
+                tt_cores,
+                retain_graph=sample_idx + 1 < grad_dense.size(0),
+                allow_unused=False,
+            )
+            for core_idx, core_grad in enumerate(core_grads):
+                per_core_samples[core_idx].append(core_grad.detach())
+
+    for core, sample_list in zip(tt_cores, per_core_samples):
+        grad_samples[core] = torch.stack(sample_list, dim=0)
+
+    return grad_samples
+
+
 def _get_or_build_cached_activations(
     module: nn.Module,
     activations,
@@ -182,20 +234,22 @@ if register_grad_sampler is not None:
 
     @register_grad_sampler(_TTLORA_MODULE_TYPES)
     def compute_ttlora_grad_sample(module, activations, backprops):
-        if getattr(module, "mode", "contraction") != "contraction":
-            raise NotImplementedError(
-                "Opacus TT-LoRA support currently covers contraction mode only. "
-                "Reconstruction mode needs a separate per-sample gradient implementation."
-            )
-
         if isinstance(activations, (list, tuple)) and activations:
             x_flat = activations[0]
         else:
             x_flat = activations
         if not torch.is_tensor(x_flat):
             raise ValueError("Expected tensor activations for TT-LoRA Opacus grad sampler.")
-        cached_activations = _get_or_build_cached_activations(module, activations)
-        grad_samples = _tt_contraction_grad_samples(module, x_flat=x_flat, d_y=backprops, cached_activations=cached_activations)
+        if getattr(module, "mode", "contraction") == "contraction":
+            cached_activations = _get_or_build_cached_activations(module, activations)
+            grad_samples = _tt_contraction_grad_samples(
+                module,
+                x_flat=x_flat,
+                d_y=backprops,
+                cached_activations=cached_activations,
+            )
+        else:
+            grad_samples = _tt_reconstruction_grad_samples(module, x_flat=x_flat, d_y=backprops)
         if hasattr(module, "_tt_opacus_activations"):
             delattr(module, "_tt_opacus_activations")
         return grad_samples

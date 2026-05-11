@@ -61,6 +61,7 @@ class StepRecord:
     learning_rate: float
     examples_seen_epoch: int
     elapsed_seconds: float
+    tt_core_grad_norms_json: str | None = None
 
 
 def seed_everything(seed: int) -> None:
@@ -90,6 +91,54 @@ def compute_grad_norm(model) -> float:
         grad_norm = param.grad.detach().data.norm(2)
         total += grad_norm.item() ** 2
     return math.sqrt(total)
+
+
+def compute_named_grad_norms(model, *, name_filter=None) -> dict[str, float]:
+    grad_norms: dict[str, float] = {}
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if name_filter is not None and not name_filter(name, param):
+            continue
+        grad_norms[name] = float(param.grad.detach().data.norm(2).item())
+    return grad_norms
+
+
+def compute_ttlora_core_grad_norms(model) -> dict[str, float]:
+    return compute_named_grad_norms(
+        model,
+        name_filter=lambda name, _param: ".tt_cores." in name,
+    )
+
+
+def update_named_grad_norm_stats(
+    stats: dict[str, dict[str, float]],
+    current: dict[str, float],
+) -> None:
+    for name, value in current.items():
+        entry = stats.setdefault(
+            name,
+            {"sum": 0.0, "count": 0.0, "max": float("-inf"), "min": float("inf"), "last": 0.0},
+        )
+        entry["sum"] += value
+        entry["count"] += 1.0
+        entry["max"] = max(entry["max"], value)
+        entry["min"] = min(entry["min"], value)
+        entry["last"] = value
+
+
+def finalize_named_grad_norm_stats(stats: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    finalized: dict[str, dict[str, float]] = {}
+    for name, entry in stats.items():
+        count = max(1.0, entry["count"])
+        finalized[name] = {
+            "avg": entry["sum"] / count,
+            "max": entry["max"],
+            "min": entry["min"],
+            "last": entry["last"],
+            "steps": int(entry["count"]),
+        }
+    return finalized
 
 
 def evaluate(model, dataloader, device: torch.device) -> tuple[float, float]:
@@ -245,6 +294,7 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
     stale_epochs = 0
     history: list[EpochRecord] = []
     step_history: list[StepRecord] = []
+    tt_core_grad_norm_stats: dict[str, dict[str, float]] = {}
     global_optimizer_step = 0
 
     if not config.training.summary_only:
@@ -286,6 +336,8 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
             )
             if should_step:
                 grad_norm = compute_grad_norm(model)
+                tt_core_grad_norms = compute_ttlora_core_grad_norms(model)
+                update_named_grad_norm_stats(tt_core_grad_norm_stats, tt_core_grad_norms)
                 grad_norm_max = max(grad_norm_max, grad_norm)
                 grad_norm_min = min(grad_norm_min, grad_norm)
                 clipping_triggered = grad_norm > config.training.max_grad_norm
@@ -317,6 +369,9 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
                             learning_rate=current_lr,
                             examples_seen_epoch=running_examples,
                             elapsed_seconds=time.time() - start_time,
+                            tt_core_grad_norms_json=(
+                                json.dumps(tt_core_grad_norms, sort_keys=True) if tt_core_grad_norms else None
+                            ),
                         )
                     )
                 micro_loss_sum = 0.0
@@ -458,6 +513,7 @@ def run_phase1_experiment(config: ExperimentConfig) -> dict:
         ),
         "total_clipped_steps": sum(record.clipped_steps for record in history),
         "step_metrics_logged": len(step_history),
+        "tt_core_grad_norm_stats": finalize_named_grad_norm_stats(tt_core_grad_norm_stats),
         "history_path": str(history_path) if not config.training.summary_only else None,
         "step_history_path": str(step_history_path) if not config.training.summary_only else None,
         "best_checkpoint_dir": str(checkpoints_dir) if not config.training.summary_only else None,
