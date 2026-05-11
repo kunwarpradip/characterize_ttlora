@@ -64,6 +64,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.06)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--dp-enabled", action="store_true")
+    parser.add_argument("--dp-target-epsilon", type=float, default=None)
+    parser.add_argument("--dp-target-delta", type=float, default=1e-5)
+    parser.add_argument("--dp-noise-multiplier", type=float, default=None)
+    parser.add_argument("--dp-max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--dp-poisson-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use Poisson sampling through Opacus when differential privacy is enabled.",
+    )
+    parser.add_argument(
+        "--dp-secure-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Opacus secure RNG mode.",
+    )
+    parser.add_argument(
+        "--dp-grad-sample-mode",
+        default="functorch",
+        choices=("functorch", "hooks", "ghost"),
+        help="Opacus per-sample gradient backend. functorch is the safest default for TT-LoRA modules.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=5)
@@ -211,6 +234,14 @@ def main() -> None:
             weight_decay=args.weight_decay,
             warmup_ratio=args.warmup_ratio,
             max_grad_norm=args.max_grad_norm,
+            dp_enabled=args.dp_enabled,
+            dp_target_epsilon=args.dp_target_epsilon,
+            dp_target_delta=args.dp_target_delta,
+            dp_noise_multiplier=args.dp_noise_multiplier,
+            dp_max_grad_norm=args.dp_max_grad_norm,
+            dp_poisson_sampling=args.dp_poisson_sampling,
+            dp_secure_mode=args.dp_secure_mode,
+            dp_grad_sample_mode=args.dp_grad_sample_mode,
             num_workers=args.num_workers,
             seed=args.seed,
             patience=args.patience,

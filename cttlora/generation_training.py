@@ -36,6 +36,16 @@ try:
 except ImportError:
     tqdm = None
 
+try:
+    from opacus import PrivacyEngine
+except ImportError:
+    PrivacyEngine = None
+
+try:
+    from . import opacus_ttlora  # noqa: F401
+except Exception:
+    opacus_ttlora = None
+
 
 @dataclass(slots=True)
 class GenerationEpochRecord:
@@ -56,6 +66,9 @@ class GenerationEpochRecord:
     validation_improved: bool
     best_validation_loss_so_far: float
     epochs_since_improvement: int
+    dp_epsilon: float | None = None
+    dp_delta: float | None = None
+    dp_noise_multiplier: float | None = None
 
 
 @dataclass(slots=True)
@@ -71,6 +84,10 @@ class GenerationStepRecord:
     learning_rate: float
     examples_seen_epoch: int
     elapsed_seconds: float
+
+
+def _unwrap_private_model(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "_module", model)
 
 
 def seed_everything(seed: int) -> None:
@@ -164,6 +181,13 @@ def _load_epoch_history_from_csv(path: Path) -> list[GenerationEpochRecord]:
                 validation_improved=str(row["validation_improved"]).strip().lower() == "true",
                 best_validation_loss_so_far=float(row["best_validation_loss_so_far"]),
                 epochs_since_improvement=int(row["epochs_since_improvement"]),
+                dp_epsilon=float(row["dp_epsilon"]) if row.get("dp_epsilon") not in (None, "", "None") else None,
+                dp_delta=float(row["dp_delta"]) if row.get("dp_delta") not in (None, "", "None") else None,
+                dp_noise_multiplier=(
+                    float(row["dp_noise_multiplier"])
+                    if row.get("dp_noise_multiplier") not in (None, "", "None")
+                    else None
+                ),
             )
         )
     return records
@@ -394,6 +418,20 @@ def evaluate_generation(model, dataloader, device: torch.device) -> tuple[float,
 
 
 def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
+    if config.training.dp_enabled and config.training.resume_from_last_epoch:
+        raise ValueError(
+            "DP generation training does not yet support resume-from-last-epoch because Opacus optimizer/accountant state is not persisted."
+        )
+    if (
+        config.training.dp_enabled
+        and config.model.adaptation_method == "ttlora"
+        and config.model.ttlora_variant.lower() != "contraction"
+    ):
+        raise ValueError(
+            "DP TT-LoRA currently supports contraction mode only. "
+            "Reconstruction mode needs a dedicated per-sample gradient implementation."
+        )
+
     seed_everything(config.training.seed)
     base_run_dir = config.run_dir()
     run_dir = _prepare_generation_run_dir(
@@ -489,10 +527,64 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         torch.cuda.reset_peak_memory_stats(device)
         logger.info("CUDA device name: %s", torch.cuda.get_device_name(device))
 
+    model.train()
+    if config.training.dp_enabled and config.training.gradient_accumulation_steps != 1:
+        raise ValueError(
+            "Differential privacy currently requires gradient_accumulation_steps=1 in generation training."
+        )
+
     optimizer = AdamW(
         parameter_groups(model, config.training.weight_decay),
         lr=config.training.learning_rate,
     )
+    privacy_engine = None
+    dp_noise_multiplier = None
+    if config.training.dp_enabled:
+        if PrivacyEngine is None:
+            raise ImportError(
+                "Opacus is not installed in the active environment. Install it in the characterize-ttlora env first."
+            )
+        if config.training.dp_target_epsilon is None and config.training.dp_noise_multiplier is None:
+            raise ValueError(
+                "DP training requires either dp_target_epsilon or dp_noise_multiplier."
+            )
+        privacy_engine = PrivacyEngine(secure_mode=config.training.dp_secure_mode)
+        private_kwargs = {
+            "poisson_sampling": config.training.dp_poisson_sampling,
+            "grad_sample_mode": config.training.dp_grad_sample_mode,
+        }
+        if config.training.dp_target_epsilon is not None:
+            model, optimizer, train_loader = privacy_engine.make_private_with_epsilon(
+                module=model,
+                optimizer=optimizer,
+                data_loader=train_loader,
+                target_epsilon=config.training.dp_target_epsilon,
+                target_delta=config.training.dp_target_delta,
+                epochs=config.training.epochs,
+                max_grad_norm=config.training.dp_max_grad_norm,
+                **private_kwargs,
+            )
+            dp_noise_multiplier = float(optimizer.noise_multiplier)
+        else:
+            model, optimizer, train_loader = privacy_engine.make_private(
+                module=model,
+                optimizer=optimizer,
+                data_loader=train_loader,
+                noise_multiplier=config.training.dp_noise_multiplier,
+                max_grad_norm=config.training.dp_max_grad_norm,
+                **private_kwargs,
+            )
+            dp_noise_multiplier = float(config.training.dp_noise_multiplier)
+        logger.info(
+            "Enabled Opacus DP training: target_epsilon=%s delta=%s noise_multiplier=%s max_grad_norm=%s poisson_sampling=%s grad_sample_mode=%s",
+            config.training.dp_target_epsilon,
+            config.training.dp_target_delta,
+            dp_noise_multiplier,
+            config.training.dp_max_grad_norm,
+            config.training.dp_poisson_sampling,
+            config.training.dp_grad_sample_mode,
+        )
+
     steps_per_epoch = math.ceil(len(train_loader) / max(1, config.training.gradient_accumulation_steps))
     total_steps = max(1, steps_per_epoch * config.training.epochs)
     scheduler = build_scheduler(optimizer, config, total_steps)
@@ -585,10 +677,16 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 grad_norm = compute_grad_norm(model)
                 grad_norm_max = max(grad_norm_max, grad_norm)
                 grad_norm_min = min(grad_norm_min, grad_norm)
-                clipping_triggered = grad_norm > config.training.max_grad_norm
+                clip_threshold = (
+                    config.training.dp_max_grad_norm
+                    if config.training.dp_enabled
+                    else config.training.max_grad_norm
+                )
+                clipping_triggered = grad_norm > clip_threshold
                 if clipping_triggered:
                     clipped_steps += 1
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+                if not config.training.dp_enabled:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -632,7 +730,8 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
 
         train_loss = running_loss / max(1, running_examples)
         train_token_accuracy = running_token_correct / max(1, running_token_total)
-        val_loss, val_perplexity, val_token_accuracy = evaluate_generation(model, val_loader, device)
+        eval_model = _unwrap_private_model(model)
+        val_loss, val_perplexity, val_token_accuracy = evaluate_generation(eval_model, val_loader, device)
         epoch_seconds = time.time() - start_time
         peak_memory_gb = (
             torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == "cuda" else 0.0
@@ -640,6 +739,11 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         avg_grad_norm = grad_norm_sum / max(1, optimizer_steps)
         learning_rate = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
         validation_improved = val_loss < best_val_loss
+        current_dp_epsilon = (
+            float(privacy_engine.accountant.get_epsilon(delta=config.training.dp_target_delta))
+            if privacy_engine is not None
+            else None
+        )
 
         history.append(
             GenerationEpochRecord(
@@ -660,14 +764,22 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 validation_improved=validation_improved,
                 best_validation_loss_so_far=min(best_val_loss, val_loss),
                 epochs_since_improvement=0 if validation_improved else stale_epochs + 1,
+                dp_epsilon=current_dp_epsilon,
+                dp_delta=config.training.dp_target_delta if privacy_engine is not None else None,
+                dp_noise_multiplier=dp_noise_multiplier,
             )
         )
 
-        logger.info(
+        epoch_message = (
             f"[epoch {epoch}] train_loss={train_loss:.4f} train_tok_acc={train_token_accuracy:.4f} "
             f"val_loss={val_loss:.4f} val_ppl={val_perplexity:.4f} val_tok_acc={val_token_accuracy:.4f} "
             f"peak_mem_gb={peak_memory_gb:.2f} improved={validation_improved}"
         )
+        if current_dp_epsilon is not None:
+            epoch_message += (
+                f" dp_eps={current_dp_epsilon:.4f} dp_delta={config.training.dp_target_delta:.2e}"
+            )
+        logger.info(epoch_message)
 
         if not config.training.summary_only:
             _write_history_csv(run_dir / "history.csv", history)
@@ -680,7 +792,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             stale_epochs = 0
             if not config.training.summary_only:
                 checkpoints_dir.mkdir(parents=True, exist_ok=True)
-                model.save_pretrained(checkpoints_dir)
+                eval_model.save_pretrained(checkpoints_dir)
                 tokenizer.save_pretrained(checkpoints_dir)
                 logger.info("Saved new best checkpoint: %s", checkpoints_dir)
         else:
@@ -702,6 +814,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
 
     gsm8k_eval_summary = None
     cnn_eval_summary = None
+    final_model = _unwrap_private_model(model)
     if is_gsm8k_dataset(config.data.dataset_name):
         gsm8k_predictions_path = None if config.training.summary_only else run_dir / "gsm8k_predictions.csv"
         gsm8k_eval_limit = (
@@ -715,7 +828,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             config.data.generation_eval_max_new_tokens,
         )
         gsm8k_eval_summary = evaluate_gsm8k_exact_match(
-            model=model,
+            model=final_model,
             tokenizer=tokenizer,
             data_config=config.data,
             device=device,
@@ -745,7 +858,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             config.data.generation_eval_max_new_tokens,
         )
         cnn_eval_summary = evaluate_cnn_summarization(
-            model=model,
+            model=final_model,
             tokenizer=tokenizer,
             data_config=config.data,
             device=device,
@@ -804,6 +917,15 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "max_grad_norm_threshold": config.training.max_grad_norm,
         "num_workers": config.training.num_workers,
         "summary_only": config.training.summary_only,
+        "dp_enabled": config.training.dp_enabled,
+        "dp_target_epsilon": config.training.dp_target_epsilon,
+        "dp_target_delta": config.training.dp_target_delta if config.training.dp_enabled else None,
+        "dp_noise_multiplier": dp_noise_multiplier,
+        "dp_max_grad_norm": config.training.dp_max_grad_norm if config.training.dp_enabled else None,
+        "dp_poisson_sampling": config.training.dp_poisson_sampling if config.training.dp_enabled else None,
+        "dp_secure_mode": config.training.dp_secure_mode if config.training.dp_enabled else None,
+        "dp_grad_sample_mode": config.training.dp_grad_sample_mode if config.training.dp_enabled else None,
+        "dp_final_epsilon": history[-1].dp_epsilon if history and config.training.dp_enabled else None,
         "resumed_from_last_epoch": config.training.resume_from_last_epoch,
         "resume_checkpoint_epoch": resume_epoch,
         "resume_start_epoch": start_epoch if config.training.resume_from_last_epoch else None,

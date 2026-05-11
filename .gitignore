@@ -17,5 +17,7 @@ datasets/alpaca/
 datasets/wikitext/
 *.svg
 *runs_refined/
-
+analysis*
 phases/2.1.ttlora_core_count_study/analysis/parameter*/
+*.csv
+*.json

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
 from .adapters import (
+    capture_tt_contraction_activations,
     LoRALinearWrapper,
     freeze_model_parameters,
     generate_tt_cores,
@@ -114,12 +115,29 @@ class TTLoRAGenerationWrapper(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == "contraction":
+            if x.ndim == 2:
+                cache_input = x.unsqueeze(1)
+            elif x.ndim == 3:
+                cache_input = x
+            else:
+                raise ValueError(
+                    f"TTLoRAGenerationWrapper contraction expects a 2D or 3D tensor, got shape {tuple(x.shape)}."
+                )
+            if self.training and any(core.requires_grad for core in self.tt_cores):
+                self._tt_opacus_activations = capture_tt_contraction_activations(
+                    x=cache_input,
+                    tt_cores=self.tt_cores,
+                    input_factors=self.input_factors,
+                    output_factors=self.output_factors,
+                )
             update = tensorized_multiplication(
-                x=x,
+                x=cache_input,
                 tt_cores=self.tt_cores,
                 input_factors=self.input_factors,
                 output_factors=self.output_factors,
             )
+            if x.ndim == 2:
+                update = update.squeeze(1)
             return self.original(x) + update * self.alpha
 
         dense_update = reconstruct_tt_weight_matrix(

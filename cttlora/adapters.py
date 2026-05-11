@@ -76,6 +76,41 @@ def tensorized_multiplication(
     return tt_state.view(batch_size, seq_len, -1)
 
 
+def capture_tt_contraction_activations(
+    x: torch.Tensor,
+    tt_cores: nn.ParameterList,
+    input_factors: tuple[int, ...],
+    output_factors: tuple[int, ...],
+) -> tuple[torch.Tensor, ...]:
+    """
+    Cache the TT contraction states needed to compute per-sample gradients.
+
+    The layout matches the older `_mb` implementation:
+    - index 0 is the original flat input
+    - then one state before each input core contraction
+    - then one state before each output core contraction
+    """
+    if x.ndim != 3:
+        raise ValueError(f"TT contraction activation capture expects a 3D tensor, got shape {tuple(x.shape)}.")
+
+    batch_size, seq_len, _ = x.shape
+    state = x.contiguous().view(batch_size, seq_len, *input_factors[::-1]).unsqueeze(1).contiguous()
+    stored: list[torch.Tensor] = [x.detach().contiguous()]
+
+    num_input_cores = len(input_factors)
+    num_output_cores = len(output_factors)
+
+    for idx in range(num_input_cores):
+        stored.append(state.detach().contiguous())
+        state = torch.einsum("br...m,rmp->bp...", state, tt_cores[idx])
+
+    for idx in range(num_output_cores):
+        stored.append(state.detach().contiguous())
+        state = torch.einsum("br...,rnp->bp...n", state, tt_cores[num_input_cores + idx])
+
+    return tuple(stored)
+
+
 class TTLoRALinearWrapperContraction(nn.Module):
     def __init__(
         self,
@@ -219,6 +254,13 @@ class TTLoRALinearWrapper(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == "contraction":
             x_reshaped, leading_shape = self._reshape_input(x)
+            if self.training and any(core.requires_grad for core in self.tt_cores):
+                self._tt_opacus_activations = capture_tt_contraction_activations(
+                    x=x_reshaped,
+                    tt_cores=self.tt_cores,
+                    input_factors=self.input_factors,
+                    output_factors=self.output_factors,
+                )
             update = tensorized_multiplication(
                 x=x_reshaped,
                 tt_cores=self.tt_cores,

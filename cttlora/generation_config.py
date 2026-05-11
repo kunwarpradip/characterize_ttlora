@@ -60,6 +60,14 @@ class GenerationTrainingConfig:
     weight_decay: float = 0.01
     warmup_ratio: float = 0.06
     max_grad_norm: float = 1.0
+    dp_enabled: bool = False
+    dp_target_epsilon: float | None = None
+    dp_target_delta: float = 1e-5
+    dp_noise_multiplier: float | None = None
+    dp_max_grad_norm: float = 1.0
+    dp_poisson_sampling: bool = True
+    dp_secure_mode: bool = False
+    dp_grad_sample_mode: str = "functorch"
     num_workers: int = 0
     seed: int = 42
     patience: int = 3
