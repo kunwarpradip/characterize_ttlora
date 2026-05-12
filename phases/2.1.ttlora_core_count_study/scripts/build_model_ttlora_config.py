@@ -448,10 +448,10 @@ def parse_args() -> argparse.Namespace:
         help="Optional subset of attention weights to include. Defaults to all supported weights for the model.",
     )
     parser.add_argument(
-        "--rank",
-        type=int,
-        default=2,
-        help="Fixed TT-LoRA rank to use when searching for the lowest-parameter shapes. Defaults to 2.",
+        "--ranks",
+        nargs="*",
+        default=["2", "6", "10"],
+        help="TT-LoRA ranks to analyze. Defaults to 2 6 10.",
     )
     parser.add_argument(
         "--core-counts",
@@ -485,7 +485,7 @@ def main() -> None:
     analysis_root = Path(args.analysis_root).expanduser().resolve()
     config_output_dir = Path(args.config_output_dir).expanduser().resolve()
     selected_weights = parse_str_list(args.weights)
-    rank = int(args.rank)
+    ranks = parse_int_list(args.ranks) or [2, 6, 10]
     core_counts = tuple(parse_int_list(args.core_counts) or []) or None
 
     model_identity, num_layers, discovered_specs = discover_attention_weights(args.model_name, model_path)
@@ -514,34 +514,33 @@ def main() -> None:
             }
             for spec in weight_specs
         },
-        "rank": rank,
-        "configs": [],
+        "ranks": {},
     }
 
-    rank_root = model_analysis_root / f"rank{rank}"
-    analyses: dict[str, dict[str, Any]] = {}
-    for spec in weight_specs:
-        weight_output_dir = rank_root / spec.weight_name
-        analyses[spec.weight_name] = build_weight_analysis(
-            weight_spec=spec,
-            rank=rank,
-            split_strategy=args.split_strategy,
-            allow_one_factors=args.allow_one_factors,
-            core_counts=core_counts,
-            output_dir=weight_output_dir,
-        )
+    for rank in ranks:
+        rank_root = model_analysis_root / f"rank{rank}"
+        analyses: dict[str, dict[str, Any]] = {}
+        for spec in weight_specs:
+            weight_output_dir = rank_root / spec.weight_name
+            analyses[spec.weight_name] = build_weight_analysis(
+                weight_spec=spec,
+                rank=rank,
+                split_strategy=args.split_strategy,
+                allow_one_factors=args.allow_one_factors,
+                core_counts=core_counts,
+                output_dir=weight_output_dir,
+            )
 
-    _, rank_payload = build_combined_rank_outputs(
-        model_identity=model_identity,
-        model_path=model_path,
-        num_layers=num_layers,
-        rank=rank,
-        weight_specs=weight_specs,
-        analyses=analyses,
-        output_dir=rank_root,
-    )
-    config_payload["shared_core_counts"] = rank_payload["shared_core_counts"]
-    config_payload["configs"] = rank_payload["configs"]
+        _, rank_payload = build_combined_rank_outputs(
+            model_identity=model_identity,
+            model_path=model_path,
+            num_layers=num_layers,
+            rank=rank,
+            weight_specs=weight_specs,
+            analyses=analyses,
+            output_dir=rank_root,
+        )
+        config_payload["ranks"][str(rank)] = rank_payload
 
     config_path = config_output_dir / f"{model_slug}.json"
     config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")

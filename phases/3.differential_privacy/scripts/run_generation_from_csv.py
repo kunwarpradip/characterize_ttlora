@@ -205,9 +205,20 @@ def materialize_ttlora_weight_config(
     selected_weights: list[str],
 ) -> Path:
     payload = json.loads(model_config_path.read_text(encoding="utf-8"))
-    entry = next((item for item in payload.get("configs", []) if int(item["core_count"]) == core_count), None)
+    if isinstance(payload.get("ranks"), dict):
+        rank_payload = payload["ranks"].get(str(rank))
+        if rank_payload is None:
+            available_ranks = sorted(int(item) for item in payload["ranks"].keys())
+            raise ValueError(
+                f"No TT shape entry found for rank={rank} in {model_config_path}. Available ranks: {available_ranks}"
+            )
+        configs = rank_payload.get("configs", [])
+    else:
+        configs = payload.get("configs", [])
+
+    entry = next((item for item in configs if int(item["core_count"]) == core_count), None)
     if entry is None:
-        available = [int(item["core_count"]) for item in payload.get("configs", [])]
+        available = [int(item["core_count"]) for item in configs]
         raise ValueError(
             f"No TT shape entry found for core_count={core_count} in {model_config_path}. Available: {available}"
         )
