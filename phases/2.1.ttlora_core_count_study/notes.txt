@@ -2,7 +2,7 @@
 rank and the weights of the model to be adapted. 
 
 2. Use this terminal command to run the suite of the variants
-##FOR Gnereation TASK
+##FOR Generation TASK
 python /home/pkunwar/characterize_ttlora/phases/ttlora_core_count_study/scripts/run_core_count_suite.py \
   --suite-name gpt2_enron_ptb_core_study \
   --dataset-names enron ptb \
