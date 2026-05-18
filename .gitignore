@@ -21,3 +21,4 @@ analysis*
 phases/2.1.ttlora_core_count_study/analysis/parameter*/
 *.csv
 *.json
+kdd_ttlora.pdf
