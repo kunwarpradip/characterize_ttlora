@@ -26,6 +26,7 @@ def add_compact_default_args(parser: argparse.ArgumentParser, project_root: Path
     parser.add_argument("--default-lr-scheduler", default="none")
     parser.add_argument("--default-weight-decay", type=float, default=0.01)
     parser.add_argument("--default-warmup-ratio", type=float, default=0.06)
+    parser.add_argument("--default-max-grad-norm", type=float, default=1.0)
     parser.add_argument("--default-num-workers", type=int, default=0)
     parser.add_argument("--default-device", default="auto")
     parser.add_argument("--default-log-every-steps", type=int, default=10)
@@ -305,7 +306,7 @@ def expand_row_defaults(row: dict[str, str], args: argparse.Namespace, project_r
     expanded["lr_scheduler"] = normalize_optional_value(row.get("lr_scheduler")) or args.default_lr_scheduler
     expanded["weight_decay"] = normalize_optional_value(row.get("weight_decay")) or str(args.default_weight_decay)
     expanded["warmup_ratio"] = normalize_optional_value(row.get("warmup_ratio")) or str(args.default_warmup_ratio)
-    expanded["max_grad_norm"] = normalize_optional_value(row.get("max_grad_norm"))
+    expanded["max_grad_norm"] = normalize_optional_value(row.get("max_grad_norm")) or str(args.default_max_grad_norm)
     expanded["num_workers"] = normalize_optional_value(row.get("num_workers")) or str(args.default_num_workers)
     expanded["seed"] = normalize_optional_value(row.get("seed")) or str(args.default_seed)
     expanded["patience"] = normalize_optional_value(row.get("patience"))
@@ -337,9 +338,6 @@ def expand_row_defaults(row: dict[str, str], args: argparse.Namespace, project_r
         raise ValueError("Each CSV row must include 'learning_rate'.")
     if expanded["patience"] is None:
         raise ValueError("Each CSV row must include 'patience'.")
-    if expanded["max_grad_norm"] is None:
-        raise ValueError("Each CSV row must include 'max_grad_norm'.")
-
     if expanded["adaptation_method"] == "ttlora":
         rank_value = normalize_optional_value(row.get("rank")) or normalize_optional_value(row.get("ttlora_rank"))
         alpha_value = normalize_optional_value(row.get("alpha")) or normalize_optional_value(row.get("ttlora_alpha"))
