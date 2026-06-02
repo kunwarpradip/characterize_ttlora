@@ -110,8 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lora-target-weights",
         nargs="*",
-        default=("q_proj", "k_proj", "v_proj", "o_proj"),
-        help="LLaMA attention weights to adapt for plain LoRA.",
+        default=None,
+        help=(
+            "Attention weights to adapt for plain LoRA. "
+            "Defaults by model: GPT-2 uses c_attn,c_proj; LLaMA uses q_proj,k_proj,v_proj,o_proj."
+        ),
     )
     parser.add_argument("--ttlora-rank", type=int, default=6)
     parser.add_argument("--ttlora-alpha", type=float, default=8.0)
@@ -204,7 +207,7 @@ def main() -> None:
             adapt_layers=tuple(args.adapt_layers) if args.adapt_layers else None,
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
-            lora_target_weights=tuple(args.lora_target_weights),
+            lora_target_weights=tuple(args.lora_target_weights) if args.lora_target_weights else (),
         ),
         data=GenerationDataConfig(
             dataset_name=args.dataset_name,

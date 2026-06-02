@@ -10,7 +10,6 @@ from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
 from .adapters import (
     capture_tt_contraction_activations,
-    LoRALinearWrapper,
     freeze_model_parameters,
     generate_tt_cores,
     reconstruct_tt_weight_matrix,
@@ -23,6 +22,7 @@ GPT2_TARGET_MAP = {
     "c_attn": ("attn", "c_attn"),
     "c_proj": ("attn", "c_proj"),
 }
+GPT2_DEFAULT_LORA_TARGETS = ("c_attn", "c_proj")
 
 LLAMA_TARGET_MAP = {
     "q_proj": ("self_attn", "q_proj"),
@@ -34,6 +34,7 @@ LLAMA_TARGET_MAP = {
     "wv": ("self_attn", "v_proj"),
     "wo": ("self_attn", "o_proj"),
 }
+LLAMA_DEFAULT_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
 
 
 def _resolve_attr(module, path: tuple[str, ...]):
@@ -61,6 +62,28 @@ def _linear_like_features(module: nn.Module) -> tuple[int, int]:
 
 def _is_conv1d_like(module: nn.Module) -> bool:
     return module.__class__.__name__ == "Conv1D" and hasattr(module, "weight")
+
+
+class LoRAGenerationWrapper(nn.Module):
+    def __init__(self, original_layer: nn.Module, rank: int, alpha: float) -> None:
+        super().__init__()
+        if rank < 1:
+            raise ValueError("LoRA rank must be >= 1.")
+
+        in_features, out_features = _linear_like_features(original_layer)
+        self.original = original_layer
+        self.rank = rank
+        self.scaling = alpha / rank
+        self.lora_A = nn.Linear(in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, out_features, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.original(x) + self.lora_B(self.lora_A(x)) * self.scaling
 
 
 class TTLoRAGenerationWrapper(nn.Module):
@@ -347,27 +370,62 @@ def apply_llama_ttlora(model, model_config: GenerationModelConfig):
     return model
 
 
+def apply_gpt2_lora(model, model_config: GenerationModelConfig):
+    freeze_model_parameters(model)
+    if not hasattr(model, "transformer") or not hasattr(model.transformer, "h"):
+        raise ValueError("GPT-2 LoRA adaptation expects a model with transformer.h blocks.")
+
+    target_weights = tuple(weight.lower() for weight in model_config.lora_target_weights)
+    if not target_weights or target_weights == LLAMA_DEFAULT_LORA_TARGETS:
+        target_weights = GPT2_DEFAULT_LORA_TARGETS
+
+    wrapped_count = 0
+    for layer_idx, block in enumerate(model.transformer.h):
+        if not _should_adapt_layer(layer_idx, model_config.adapt_layers):
+            continue
+        for weight_name in target_weights:
+            if weight_name not in GPT2_TARGET_MAP:
+                supported = ", ".join(sorted(GPT2_TARGET_MAP))
+                raise ValueError(
+                    f"Unsupported GPT-2 LoRA target weight '{weight_name}'. Supported: {supported}."
+                )
+            path = GPT2_TARGET_MAP[weight_name]
+            original = _resolve_attr(block, path)
+            wrapped = LoRAGenerationWrapper(
+                original_layer=original,
+                rank=model_config.lora_rank,
+                alpha=model_config.lora_alpha,
+            )
+            _assign_attr(block, path, wrapped)
+            wrapped_count += 1
+
+    if wrapped_count == 0:
+        raise ValueError("No GPT-2 LoRA layers were adapted. Check the selected layers and target weights.")
+    return model
+
+
 def apply_llama_lora(model, model_config: GenerationModelConfig):
     freeze_model_parameters(model)
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise ValueError("LLaMA LoRA adaptation expects a model with model.layers blocks.")
 
+    target_weights = tuple(weight.lower() for weight in model_config.lora_target_weights) or LLAMA_DEFAULT_LORA_TARGETS
+
     wrapped_count = 0
     for layer_idx, block in enumerate(model.model.layers):
         if not _should_adapt_layer(layer_idx, model_config.adapt_layers):
             continue
-        for weight_name in model_config.lora_target_weights:
-            normalized_weight_name = weight_name.lower()
-            if normalized_weight_name not in LLAMA_TARGET_MAP:
+        for weight_name in target_weights:
+            if weight_name not in LLAMA_TARGET_MAP:
                 supported = ", ".join(sorted(LLAMA_TARGET_MAP))
                 raise ValueError(
                     f"Unsupported LLaMA LoRA target weight '{weight_name}'. Supported: {supported}."
                 )
-            path = LLAMA_TARGET_MAP[normalized_weight_name]
+            path = LLAMA_TARGET_MAP[weight_name]
             original = _resolve_attr(block, path)
             if not isinstance(original, nn.Linear):
                 raise TypeError(f"LLaMA LoRA expects nn.Linear targets, got {type(original)} for {weight_name}.")
-            wrapped = LoRALinearWrapper(
+            wrapped = LoRAGenerationWrapper(
                 original_layer=original,
                 rank=model_config.lora_rank,
                 alpha=model_config.lora_alpha,
@@ -391,7 +449,9 @@ def apply_generation_lora(model, model_config: GenerationModelConfig):
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
     if model_type == "llama" or (hasattr(model, "model") and hasattr(model.model, "layers")):
         return apply_llama_lora(model, model_config)
-    raise ValueError("Generation LoRA is currently implemented for LLaMA-style nn.Linear attention weights.")
+    if model_type == "gpt2" or (hasattr(model, "transformer") and hasattr(model.transformer, "h")):
+        return apply_gpt2_lora(model, model_config)
+    raise ValueError("Generation LoRA is currently implemented for GPT-2 and LLaMA-style attention weights.")
 
 
 def apply_generation_adaptation(model, model_config: GenerationModelConfig):
