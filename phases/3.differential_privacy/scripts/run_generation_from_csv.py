@@ -256,9 +256,11 @@ def derive_run_name(expanded_row: dict[str, Any]) -> str:
         eps_token = format_float_token(expanded_row["dp_target_epsilon"])
         if expanded_row["adaptation_method"] == "ttlora":
             core_count = int(expanded_row["core_count"])
+            alpha = expanded_row["ttlora_alpha"]
             variant = sanitize_name_token(str(expanded_row["ttlora_variant"]))
-            return f"{model}_{dataset}_{method}_{variant}_cores{core_count}_rank{rank}_eps{eps_token}_lr{lr_token}_seed{seed}"
-        return f"{model}_{dataset}_{method}_rank{rank}_eps{eps_token}_lr{lr_token}_seed{seed}"
+            return f"{model}_{dataset}_{method}_{variant}_cores{core_count}_rank{rank}_alpha{alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
+        lora_alpha= expanded_row["lora_alpha"]
+        return f"{model}_{dataset}_{method}_rank{rank}_alpha{lora_alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
     if expanded_row["adaptation_method"] == "ttlora":
         core_count = int(expanded_row["core_count"])
         variant = sanitize_name_token(str(expanded_row["ttlora_variant"]))
