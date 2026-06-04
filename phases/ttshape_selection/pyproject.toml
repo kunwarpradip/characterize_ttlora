@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttshape-selection"
+version = "0.1.0"
+description = "Generate and inspect Tensor-Train shape candidates for TT-LoRA adapters."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "TT-Shape Selection Contributors"}
+]
+dependencies = []
+
+[project.scripts]
+ttshape-select = "ttshape_selection.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ttshape_selection*"]

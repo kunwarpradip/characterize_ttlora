@@ -1,0 +1,12 @@
+{
+  "weights": [
+    {
+      "name": "c_attn",
+      "shape": [2304, 768]
+    },
+    {
+      "name": "c_proj",
+      "shape": [768, 768]
+    }
+  ]
+}

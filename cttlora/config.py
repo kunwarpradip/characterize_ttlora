@@ -48,7 +48,7 @@ class TrainingConfig:
     epochs: int = 5
     learning_rate: float = 2e-5  # Interpreted as base/peak LR depending on scheduler choice.
     lr_scheduler: str = "none"
-    weight_decay: float = 0.01
+    weight_decay: float = 0.00
     warmup_ratio: float = 0.06
     max_grad_norm: float = 1.0
     num_workers: int = 4
