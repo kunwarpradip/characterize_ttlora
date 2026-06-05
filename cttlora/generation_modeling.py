@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import os
 from pathlib import Path
 
 import torch
@@ -13,6 +16,7 @@ from .adapters import (
     freeze_model_parameters,
     generate_tt_cores,
     reconstruct_tt_weight_matrix,
+    stable_ttlora_init_seed,
     tensorized_multiplication,
     ttlora_rank_list,
 )
@@ -35,6 +39,24 @@ LLAMA_TARGET_MAP = {
     "wo": ("self_attn", "o_proj"),
 }
 LLAMA_DEFAULT_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+
+def _debug_ttlora_core_fingerprints(label: str, layer_idx: int, weight_name: str, wrapped) -> None:
+    if os.environ.get("DEBUG_TT_CORES") != "1":
+        return
+    for core_idx, core in enumerate(wrapped.tt_cores):
+        tensor = core.detach().cpu().contiguous()
+        payload = {
+            "label": label,
+            "layer": int(layer_idx),
+            "weight": str(weight_name),
+            "core": int(core_idx),
+            "shape": list(tensor.shape),
+            "norm": float(tensor.norm().item()),
+            "sum": float(tensor.sum().item()),
+            "sha256": hashlib.sha256(tensor.numpy().tobytes()).hexdigest(),
+        }
+        print("[TTCORE-DEBUG] " + json.dumps(payload, sort_keys=True))
 
 
 def _resolve_attr(module, path: tuple[str, ...]):
@@ -94,6 +116,7 @@ class TTLoRAGenerationWrapper(nn.Module):
         rank: int,
         alpha: float,
         mode: str,
+        init_seed: int | None = None,
     ) -> None:
         super().__init__()
         if mode not in {"contraction", "reconstruction"}:
@@ -107,8 +130,7 @@ class TTLoRAGenerationWrapper(nn.Module):
         self.output_factors = weight_config.output_factors
         self.tt_shape = weight_config.tt_shape
         self.tt_rank = ttlora_rank_list(rank, self.tt_shape)
-        self.tt_cores = generate_tt_cores(self.tt_shape, self.tt_rank)
-
+        self.tt_cores = generate_tt_cores(self.tt_shape, self.tt_rank, init_seed=init_seed)
         in_features, out_features = _linear_like_features(original_layer)
         if math.prod(self.input_factors) != in_features:
             raise ValueError(
@@ -328,7 +350,9 @@ def apply_gpt2_ttlora(model, model_config: GenerationModelConfig):
                 rank=model_config.ttlora_rank,
                 alpha=model_config.ttlora_alpha,
                 mode=model_config.ttlora_variant.lower(),
+                init_seed=stable_ttlora_init_seed(torch.initial_seed(), layer_idx, weight_name),
             )
+            _debug_ttlora_core_fingerprints("characterize-ttlora", layer_idx, weight_name, wrapped)
             _assign_attr(block, path, wrapped)
             wrapped_count += 1
 
@@ -361,7 +385,9 @@ def apply_llama_ttlora(model, model_config: GenerationModelConfig):
                 rank=model_config.ttlora_rank,
                 alpha=model_config.ttlora_alpha,
                 mode=model_config.ttlora_variant.lower(),
+                init_seed=stable_ttlora_init_seed(torch.initial_seed(), layer_idx, weight_name),
             )
+            _debug_ttlora_core_fingerprints("characterize-ttlora", layer_idx, weight_name, wrapped)
             _assign_attr(block, path, wrapped)
             wrapped_count += 1
 
@@ -475,7 +501,36 @@ def load_generation_model(model_config: GenerationModelConfig):
         if isinstance(eos_token_id, list):
             eos_token_id = eos_token_id[0]
         model.config.pad_token_id = eos_token_id
-    return apply_generation_adaptation(model, model_config)
+    return model
+
+
+def resize_generation_model_for_tokenizer(model, tokenizer):
+    tokenizer_size = len(tokenizer)
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    old_input_weight = input_embeddings.weight.detach().clone() if input_embeddings is not None else None
+    old_output_weight = output_embeddings.weight.detach().clone() if output_embeddings is not None else None
+
+    current_size = int(input_embeddings.weight.size(0)) if input_embeddings is not None else tokenizer_size
+    if tokenizer_size == current_size:
+        model.config.pad_token_id = getattr(tokenizer, "pad_token_id", model.config.pad_token_id)
+        return model
+    if tokenizer_size < current_size:
+        raise ValueError(
+            f"Tokenizer size {tokenizer_size} is smaller than model embedding size {current_size}; "
+            "cannot safely shrink generation model embeddings."
+        )
+
+    model.resize_token_embeddings(tokenizer_size)
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    old_size = current_size
+    if old_input_weight is not None:
+        input_embeddings.weight.data[old_size:] = old_input_weight.mean(dim=0)
+    if old_output_weight is not None and output_embeddings is not None:
+        output_embeddings.weight.data[old_size:] = old_output_weight.mean(dim=0)
+    model.config.pad_token_id = getattr(tokenizer, "pad_token_id", model.config.pad_token_id)
+    return model
 
 
 def load_generation_checkpoint_into_model(model: nn.Module, checkpoint_dir: str | Path) -> tuple[list[str], list[str]]:

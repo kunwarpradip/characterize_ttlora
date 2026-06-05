@@ -18,12 +18,32 @@ def ttlora_rank_list(rank: int, tt_shape: tuple[int, ...]) -> tuple[int, ...]:
     return (1, *([rank] * (len(tt_shape) - 1)), 1)
 
 
-def generate_tt_cores(tt_shape: tuple[int, ...], tt_rank: tuple[int, ...]) -> nn.ParameterList:
+_TT_INIT_SEED_MOD = 2**31 - 1
+
+
+def stable_ttlora_init_seed(base_seed: int, layer_idx: int, weight_name: str) -> int:
+    value = int(base_seed) % _TT_INIT_SEED_MOD
+    value = (value + 1009 * int(layer_idx)) % _TT_INIT_SEED_MOD
+    for char in str(weight_name):
+        value = (value * 131 + ord(char)) % _TT_INIT_SEED_MOD
+    return value
+
+
+def generate_tt_cores(
+    tt_shape: tuple[int, ...],
+    tt_rank: tuple[int, ...],
+    init_seed: int | None = None,
+) -> nn.ParameterList:
     cores = nn.ParameterList()
     for idx, dim in enumerate(tt_shape):
         core_shape = (tt_rank[idx], dim, tt_rank[idx + 1])
         core = nn.Parameter(torch.empty(core_shape))
-        nn.init.kaiming_uniform_(core, a=math.sqrt(8))
+        if init_seed is None:
+            nn.init.kaiming_uniform_(core, a=math.sqrt(8))
+        else:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed((int(init_seed) + idx) % _TT_INIT_SEED_MOD)
+            nn.init.kaiming_uniform_(core, a=math.sqrt(8), generator=generator)
         core.data /= core.data.norm() + 1e-6
         cores.append(core)
     return cores

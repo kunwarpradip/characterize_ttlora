@@ -27,7 +27,12 @@ from .generation_eval import (
     is_cnn_dataset,
     is_gsm8k_dataset,
 )
-from .generation_modeling import load_generation_checkpoint_into_model, load_generation_model
+from .generation_modeling import (
+    apply_generation_adaptation,
+    load_generation_checkpoint_into_model,
+    load_generation_model,
+    resize_generation_model_for_tokenizer,
+)
 from .modeling import count_parameters, parameter_groups, trainable_parameter_names
 from .training import (
     compute_grad_norm,
@@ -76,6 +81,9 @@ class GenerationEpochRecord:
     dp_epsilon: float | None = None
     dp_delta: float | None = None
     dp_noise_multiplier: float | None = None
+    dp_snr: float | None = None
+    dp_signal_norm: float | None = None
+    dp_noise_norm: float | None = None
 
 
 @dataclass(slots=True)
@@ -127,6 +135,56 @@ def _write_step_history_csv(path: Path, records: list[GenerationStepRecord]) -> 
         writer.writeheader()
         for record in records:
             writer.writerow(asdict(record))
+
+
+def _as_grad_sample_tensor(grad_sample) -> torch.Tensor | None:
+    if grad_sample is None:
+        return None
+    if isinstance(grad_sample, list):
+        tensors = [item for item in grad_sample if item is not None]
+        if not tensors:
+            return None
+        return torch.cat(tensors, dim=0)
+    return grad_sample
+
+
+def estimate_dp_step_snr(model, max_grad_norm: float, noise_multiplier: float | None) -> tuple[float, float, float] | None:
+    if noise_multiplier is None or noise_multiplier <= 0:
+        return None
+
+    grad_samples: list[torch.Tensor] = []
+    sample_norm_sq = None
+    trainable_parameter_count = 0
+
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        trainable_parameter_count += param.numel()
+        grad_sample = _as_grad_sample_tensor(getattr(param, "grad_sample", None))
+        if grad_sample is None:
+            continue
+        flat = grad_sample.reshape(grad_sample.shape[0], -1)
+        current_norm_sq = flat.pow(2).sum(dim=1)
+        sample_norm_sq = current_norm_sq if sample_norm_sq is None else sample_norm_sq + current_norm_sq
+        grad_samples.append(grad_sample)
+
+    if sample_norm_sq is None or not grad_samples or trainable_parameter_count == 0:
+        return None
+
+    sample_norm = sample_norm_sq.sqrt()
+    clip_coef = (float(max_grad_norm) / (sample_norm + 1e-6)).clamp(max=1.0)
+    signal_norm_sq = torch.zeros((), device=sample_norm.device)
+
+    for grad_sample in grad_samples:
+        coef = clip_coef.to(device=grad_sample.device, dtype=grad_sample.dtype)
+        view_shape = (coef.shape[0],) + (1,) * (grad_sample.dim() - 1)
+        clipped_sum = (grad_sample * coef.view(view_shape)).sum(dim=0)
+        signal_norm_sq = signal_norm_sq + clipped_sum.detach().float().pow(2).sum().to(signal_norm_sq.device)
+
+    signal_norm = float(signal_norm_sq.sqrt().item())
+    noise_norm = float(noise_multiplier) * float(max_grad_norm) * math.sqrt(trainable_parameter_count)
+    snr = signal_norm / noise_norm if noise_norm > 0 else float("inf")
+    return snr, signal_norm, noise_norm
 
 
 def _save_json(path: Path, payload: dict) -> None:
@@ -523,6 +581,8 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         type(tokenizer).__name__,
     )
     model = load_generation_model(config.model)
+    model = resize_generation_model_for_tokenizer(model, tokenizer)
+    model = apply_generation_adaptation(model, config.model)
     if config.training.resume_from_last_epoch:
         missing_keys, unexpected_keys = load_generation_checkpoint_into_model(model, checkpoints_dir)
         if missing_keys or unexpected_keys:
@@ -659,6 +719,10 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         grad_norm_min = float("inf")
         clipped_steps = 0
         optimizer_steps = 0
+        dp_snr_sum = 0.0
+        dp_signal_norm_sum = 0.0
+        dp_noise_norm_sum = 0.0
+        dp_snr_steps = 0
         micro_loss_sum = 0.0
         micro_examples = 0
         micro_token_correct = 0
@@ -714,6 +778,11 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                     clipped_steps += 1
                 if not config.training.dp_enabled:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+                dp_step_snr = (
+                    estimate_dp_step_snr(model, config.training.dp_max_grad_norm, dp_noise_multiplier)
+                    if config.training.dp_enabled
+                    else None
+                )
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -721,6 +790,12 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 grad_norm_sum += grad_norm
                 optimizer_steps += 1
                 global_optimizer_step += 1
+                if dp_step_snr is not None:
+                    step_snr, step_signal_norm, step_noise_norm = dp_step_snr
+                    dp_snr_sum += step_snr
+                    dp_signal_norm_sum += step_signal_norm
+                    dp_noise_norm_sum += step_noise_norm
+                    dp_snr_steps += 1
                 current_lr = (
                     scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
                 )
@@ -756,6 +831,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                         f"epoch={epoch} step={optimizer_steps}/{steps_per_epoch} "
                         f"train_loss={avg_loss:.4f} train_tok_acc={avg_token_accuracy:.4f} grad_norm={grad_norm:.4f} "
                         f"clipped={clipping_triggered} lr={current_lr:.2e}"
+                        + (f" dp_snr={dp_step_snr[0]:.4f}" if dp_step_snr is not None else "")
                     )
 
         train_loss = running_loss / max(1, running_examples)
@@ -767,6 +843,9 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == "cuda" else 0.0
         )
         avg_grad_norm = grad_norm_sum / max(1, optimizer_steps)
+        avg_dp_snr = dp_snr_sum / dp_snr_steps if dp_snr_steps else None
+        avg_dp_signal_norm = dp_signal_norm_sum / dp_snr_steps if dp_snr_steps else None
+        avg_dp_noise_norm = dp_noise_norm_sum / dp_snr_steps if dp_snr_steps else None
         learning_rate = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
         validation_improved = val_loss < best_val_loss
         current_dp_epsilon = (
@@ -797,6 +876,9 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 dp_epsilon=current_dp_epsilon,
                 dp_delta=config.training.dp_target_delta if privacy_engine is not None else None,
                 dp_noise_multiplier=dp_noise_multiplier,
+                dp_snr=avg_dp_snr,
+                dp_signal_norm=avg_dp_signal_norm,
+                dp_noise_norm=avg_dp_noise_norm,
             )
         )
 
@@ -808,6 +890,11 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         if current_dp_epsilon is not None:
             epoch_message += (
                 f" dp_eps={current_dp_epsilon:.4f} dp_delta={config.training.dp_target_delta:.2e}"
+            )
+        if avg_dp_snr is not None:
+            epoch_message += (
+                f" dp_snr={avg_dp_snr:.4f} dp_signal_norm={avg_dp_signal_norm:.4f} "
+                f"dp_noise_norm={avg_dp_noise_norm:.4f}"
             )
         logger.info(epoch_message)
 
@@ -956,6 +1043,9 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "dp_secure_mode": config.training.dp_secure_mode if config.training.dp_enabled else None,
         "dp_grad_sample_mode": config.training.dp_grad_sample_mode if config.training.dp_enabled else None,
         "dp_final_epsilon": history[-1].dp_epsilon if history and config.training.dp_enabled else None,
+        "dp_final_snr": history[-1].dp_snr if history and config.training.dp_enabled else None,
+        "dp_final_signal_norm": history[-1].dp_signal_norm if history and config.training.dp_enabled else None,
+        "dp_final_noise_norm": history[-1].dp_noise_norm if history and config.training.dp_enabled else None,
         "resumed_from_last_epoch": config.training.resume_from_last_epoch,
         "resume_checkpoint_epoch": resume_epoch,
         "resume_start_epoch": start_epoch if config.training.resume_from_last_epoch else None,
@@ -1021,6 +1111,24 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         ),
         "avg_grad_norm": (
             sum(record.avg_grad_norm for record in history) / len(history) if history else 0.0
+        ),
+        "avg_dp_snr": (
+            sum(record.dp_snr for record in history if record.dp_snr is not None)
+            / max(1, sum(1 for record in history if record.dp_snr is not None))
+            if history and config.training.dp_enabled
+            else None
+        ),
+        "avg_dp_signal_norm": (
+            sum(record.dp_signal_norm for record in history if record.dp_signal_norm is not None)
+            / max(1, sum(1 for record in history if record.dp_signal_norm is not None))
+            if history and config.training.dp_enabled
+            else None
+        ),
+        "avg_dp_noise_norm": (
+            sum(record.dp_noise_norm for record in history if record.dp_noise_norm is not None)
+            / max(1, sum(1 for record in history if record.dp_noise_norm is not None))
+            if history and config.training.dp_enabled
+            else None
         ),
         "max_grad_norm": max((record.max_grad_norm for record in history), default=0.0),
         "min_grad_norm": min((record.min_grad_norm for record in history), default=0.0),

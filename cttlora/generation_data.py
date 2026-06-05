@@ -455,9 +455,7 @@ def prepare_generation_data(
 ) -> tuple[PreTrainedTokenizerBase, Dataset, Dataset, DataLoader, DataLoader, GenerationDataStats]:
     tokenizer = resolve_generation_tokenizer(tokenizer_name_or_path)
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        if tokenizer.pad_token is None:
-            raise ValueError("Tokenizer has no pad_token or eos_token.")
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     if data_config.training_format == "prompt_completion":
         if is_gsm8k_dataset_name(data_config.dataset_name):
@@ -498,6 +496,8 @@ def prepare_generation_data(
     tokenized = dataset.map(
         tokenize_batch,
         batched=True,
+        num_proc=16,
+        load_from_cache_file=True,
         remove_columns=dataset[data_config.train_split].column_names,
     )
 
@@ -515,7 +515,10 @@ def prepare_generation_data(
         result["labels"] = list(result["input_ids"])
         return result
 
-    grouped = tokenized.map(group_texts, batched=True)
+    grouped = tokenized.map(group_texts, 
+        batched=True,
+        num_proc=16,
+        load_from_cache_file=True)
     train_dataset = _select_subset(grouped[data_config.train_split], data_config.max_train_samples)
     val_dataset = _select_subset(grouped[data_config.validation_split], data_config.max_eval_samples)
     data_stats = GenerationDataStats(
@@ -527,6 +530,7 @@ def prepare_generation_data(
     )
     train_dataset.set_format("torch")
     val_dataset.set_format("torch")
+
 
     train_loader = DataLoader(
         train_dataset,

@@ -17,9 +17,9 @@ def add_compact_default_args(parser: argparse.ArgumentParser, project_root: Path
     parser.add_argument("--default-ttshape-config-root", default=str(project_root / "ttshape_configs" / "ttlora"))
     parser.add_argument("--default-core-count", type=int, default=6)
     parser.add_argument("--default-ttlora-variant", default="reconstruction", choices=("contraction", "reconstruction"))
-    parser.add_argument("--default-seed", type=int, default=647761)
-    parser.add_argument("--default-batch-size", type=int, default=32)
-    parser.add_argument("--default-eval-batch-size", type=int, default=32)
+    parser.add_argument("--default-seed", type=int, default=42)
+    parser.add_argument("--default-batch-size", type=int, default=16)
+    parser.add_argument("--default-eval-batch-size", type=int, default=16)
     parser.add_argument("--default-gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--default-max-length", type=int, default=1024)
     parser.add_argument("--default-training-format", default="blocks", choices=("blocks", "prompt_completion"))
@@ -551,7 +551,7 @@ def main() -> None:
             train_script=train_script,
         )
         print(f"[run] {run_name}")
-        sys.exit(1)
+
         print(" ".join(shlex.quote(part) for part in command))
         
         if args.dry_run:

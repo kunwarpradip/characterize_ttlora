@@ -51,8 +51,8 @@ class GenerationTrainingConfig:
     overwrite_run_dir: bool = False
     resume_from_last_epoch: bool = False
     summary_only: bool = False
-    batch_size: int = 8
-    eval_batch_size: int = 8
+    batch_size: int = 16
+    eval_batch_size: int = 16
     gradient_accumulation_steps: int = 1
     epochs: int = 5
     learning_rate: float = 2e-4

@@ -23,3 +23,4 @@ phases/2.1.ttlora_core_count_study/analysis/parameter*/
 *.json
 !phases/ttshape_selection/examples/*.json
 kdd_ttlora.pdf
+*.log
