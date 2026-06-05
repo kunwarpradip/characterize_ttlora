@@ -59,6 +59,24 @@ def _debug_ttlora_core_fingerprints(label: str, layer_idx: int, weight_name: str
         print("[TTCORE-DEBUG] " + json.dumps(payload, sort_keys=True))
 
 
+def _debug_lora_weight_fingerprints(label: str, layer_idx: int, weight_name: str, wrapped) -> None:
+    if os.environ.get("DEBUG_LORA_WEIGHTS") != "1":
+        return
+    for lora_name, parameter in (("lora_A", wrapped.lora_A.weight), ("lora_B", wrapped.lora_B.weight)):
+        tensor = parameter.detach().cpu().contiguous()
+        payload = {
+            "label": label,
+            "layer": int(layer_idx),
+            "weight": str(weight_name),
+            "lora_weight": lora_name,
+            "shape": list(tensor.shape),
+            "norm": float(tensor.norm().item()),
+            "sum": float(tensor.sum().item()),
+            "sha256": hashlib.sha256(tensor.numpy().tobytes()).hexdigest(),
+        }
+        print("[LORA-DEBUG] " + json.dumps(payload, sort_keys=True))
+
+
 def _resolve_attr(module, path: tuple[str, ...]):
     current = module
     for name in path:
@@ -87,7 +105,13 @@ def _is_conv1d_like(module: nn.Module) -> bool:
 
 
 class LoRAGenerationWrapper(nn.Module):
-    def __init__(self, original_layer: nn.Module, rank: int, alpha: float) -> None:
+    def __init__(
+        self,
+        original_layer: nn.Module,
+        rank: int,
+        alpha: float,
+        init_seed: int | None = None,
+    ) -> None:
         super().__init__()
         if rank < 1:
             raise ValueError("LoRA rank must be >= 1.")
@@ -96,12 +120,18 @@ class LoRAGenerationWrapper(nn.Module):
         self.original = original_layer
         self.rank = rank
         self.scaling = alpha / rank
+        self.init_seed = init_seed
         self.lora_A = nn.Linear(in_features, rank, bias=False)
         self.lora_B = nn.Linear(rank, out_features, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        if self.init_seed is None:
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        else:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(int(self.init_seed) % (2**31 - 1))
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5), generator=generator)
         nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -421,7 +451,9 @@ def apply_gpt2_lora(model, model_config: GenerationModelConfig):
                 original_layer=original,
                 rank=model_config.lora_rank,
                 alpha=model_config.lora_alpha,
+                init_seed=stable_ttlora_init_seed(torch.initial_seed(), layer_idx, weight_name),
             )
+            _debug_lora_weight_fingerprints("characterize-ttlora", layer_idx, weight_name, wrapped)
             _assign_attr(block, path, wrapped)
             wrapped_count += 1
 
@@ -455,7 +487,9 @@ def apply_llama_lora(model, model_config: GenerationModelConfig):
                 original_layer=original,
                 rank=model_config.lora_rank,
                 alpha=model_config.lora_alpha,
+                init_seed=stable_ttlora_init_seed(torch.initial_seed(), layer_idx, weight_name),
             )
+            _debug_lora_weight_fingerprints("characterize-ttlora", layer_idx, weight_name, wrapped)
             _assign_attr(block, path, wrapped)
             wrapped_count += 1
 
