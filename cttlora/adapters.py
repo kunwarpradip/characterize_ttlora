@@ -229,6 +229,7 @@ class TTLoRALinearWrapper(nn.Module):
         self.mode = mode
         self.input_factors = input_factors
         self.output_factors = output_factors
+        self._cache_opacus_activations = False
 
         if math.prod(input_factors) != original_layer.in_features:
             raise ValueError(
@@ -274,7 +275,11 @@ class TTLoRALinearWrapper(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mode == "contraction":
             x_reshaped, leading_shape = self._reshape_input(x)
-            if self.training and any(core.requires_grad for core in self.tt_cores):
+            if (
+                self.training
+                and self._cache_opacus_activations
+                and any(core.requires_grad for core in self.tt_cores)
+            ):
                 self._tt_opacus_activations = capture_tt_contraction_activations(
                     x=x_reshaped,
                     tt_cores=self.tt_cores,

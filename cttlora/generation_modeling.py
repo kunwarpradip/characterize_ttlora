@@ -160,6 +160,7 @@ class TTLoRAGenerationWrapper(nn.Module):
         self.output_factors = weight_config.output_factors
         self.tt_shape = weight_config.tt_shape
         self.tt_rank = ttlora_rank_list(rank, self.tt_shape)
+        self._cache_opacus_activations = False
         self.tt_cores = generate_tt_cores(self.tt_shape, self.tt_rank, init_seed=init_seed)
         in_features, out_features = _linear_like_features(original_layer)
         if math.prod(self.input_factors) != in_features:
@@ -198,7 +199,11 @@ class TTLoRAGenerationWrapper(nn.Module):
                 raise ValueError(
                     f"TTLoRAGenerationWrapper contraction expects a 2D or 3D tensor, got shape {tuple(x.shape)}."
                 )
-            if self.training and any(core.requires_grad for core in self.tt_cores):
+            if (
+                self.training
+                and self._cache_opacus_activations
+                and any(core.requires_grad for core in self.tt_cores)
+            ):
                 self._tt_opacus_activations = capture_tt_contraction_activations(
                     x=cache_input,
                     tt_cores=self.tt_cores,

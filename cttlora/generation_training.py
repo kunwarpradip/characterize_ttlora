@@ -633,6 +633,9 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             raise ValueError(
                 "DP training requires either dp_target_epsilon or dp_noise_multiplier."
             )
+        ttlora_cache_modules = 0
+        if opacus_ttlora is not None and hasattr(opacus_ttlora, "set_ttlora_opacus_activation_cache"):
+            ttlora_cache_modules = opacus_ttlora.set_ttlora_opacus_activation_cache(model, True)
         privacy_engine = PrivacyEngine(secure_mode=config.training.dp_secure_mode)
         private_kwargs = {
             "poisson_sampling": config.training.dp_poisson_sampling,
@@ -669,6 +672,11 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
             config.training.dp_poisson_sampling,
             config.training.dp_grad_sample_mode,
         )
+        if ttlora_cache_modules:
+            logger.info(
+                "Enabled TT-LoRA Opacus activation cache for %d module(s).",
+                ttlora_cache_modules,
+            )
 
     steps_per_epoch = math.ceil(len(train_loader) / max(1, config.training.gradient_accumulation_steps))
     total_steps = max(1, steps_per_epoch * config.training.epochs)

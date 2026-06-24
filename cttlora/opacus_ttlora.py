@@ -171,6 +171,23 @@ def _get_or_build_cached_activations(
     )
 
 
+def set_ttlora_opacus_activation_cache(model: nn.Module, enabled: bool) -> int:
+    """Enable forward-time TT activation caching only for Opacus DP training."""
+    updated = 0
+    for module in model.modules():
+        if not (
+            hasattr(module, "tt_cores")
+            and hasattr(module, "input_factors")
+            and hasattr(module, "output_factors")
+        ):
+            continue
+        setattr(module, "_cache_opacus_activations", bool(enabled))
+        if not enabled and hasattr(module, "_tt_opacus_activations"):
+            delattr(module, "_tt_opacus_activations")
+        updated += 1
+    return updated
+
+
 if register_grad_sampler is not None:
     _TTLORA_MODULE_TYPES = (TTLoRAGenerationWrapper, TTLoRALinearWrapperContraction, TTLoRALinearWrapper)
 
