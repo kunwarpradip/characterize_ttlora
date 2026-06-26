@@ -361,7 +361,12 @@ def expand_row_defaults(row: dict[str, str], args: argparse.Namespace, project_r
         expanded["run_name"] = derive_run_name(expanded)
         expanded["ttlora_weight_config"] = normalize_optional_value(row.get("ttlora_weight_config"))
         if expanded["ttlora_weight_config"] is None:
-            ttshape_config_root = Path(args.default_ttshape_config_root).expanduser().resolve()
+            expanded["ttshape_config_root"] = (
+                normalize_optional_value(row.get("ttshape_config_root"))
+                or normalize_optional_value(row.get("default_ttshape_config_root"))
+                or args.default_ttshape_config_root
+            )
+            ttshape_config_root = Path(expanded["ttshape_config_root"]).expanduser().resolve()
             model_config_path = resolve_ttlora_model_config_path(
                 model_name=str(model_name),
                 ttshape_config_root=ttshape_config_root,
