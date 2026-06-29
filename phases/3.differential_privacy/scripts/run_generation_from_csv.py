@@ -245,6 +245,8 @@ def derive_run_name(expanded_row: dict[str, Any]) -> str:
     dataset = sanitize_name_token(str(expanded_row["dataset_name"]))
     model = sanitize_name_token(str(expanded_row["model"]))
     method = sanitize_name_token(str(expanded_row["adaptation_method"]))
+    ttshape_label = sanitize_name_token(str(expanded_row.get("ttshape_config_label") or ""))
+    ttshape_segment = f"_{ttshape_label}" if ttshape_label else ""
     rank = int(
         expanded_row["ttlora_rank"]
         if expanded_row["adaptation_method"] == "ttlora"
@@ -258,14 +260,22 @@ def derive_run_name(expanded_row: dict[str, Any]) -> str:
             core_count = int(expanded_row["core_count"])
             alpha = expanded_row["ttlora_alpha"]
             variant = sanitize_name_token(str(expanded_row["ttlora_variant"]))
-            return f"{model}_{dataset}_{method}_{variant}_cores{core_count}_rank{rank}_alpha{alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
+            return f"{model}_{dataset}_{method}_{variant}{ttshape_segment}_cores{core_count}_rank{rank}_alpha{alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
         lora_alpha= expanded_row["lora_alpha"]
         return f"{model}_{dataset}_{method}_rank{rank}_alpha{lora_alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
     if expanded_row["adaptation_method"] == "ttlora":
         core_count = int(expanded_row["core_count"])
         variant = sanitize_name_token(str(expanded_row["ttlora_variant"]))
-        return f"{model}_{dataset}_{method}_{variant}_cores{core_count}_rank{rank}_lr{lr_token}_seed{seed}"
+        return f"{model}_{dataset}_{method}_{variant}{ttshape_segment}_cores{core_count}_rank{rank}_lr{lr_token}_seed{seed}"
     return f"{model}_{dataset}_{method}_rank{rank}_lr{lr_token}_seed{seed}"
+
+
+def infer_ttshape_config_label(ttshape_config_root: str) -> str:
+    path = Path(ttshape_config_root).expanduser()
+    label = path.name
+    if label in {"ttshape_root", "ttlora", "configs"} and path.parent.name:
+        label = path.parent.name
+    return sanitize_name_token(label)
 
 
 def expand_row_defaults(row: dict[str, str], args: argparse.Namespace, project_root: Path) -> dict[str, Any]:
@@ -358,12 +368,21 @@ def expand_row_defaults(row: dict[str, str], args: argparse.Namespace, project_r
             or normalize_optional_value(row.get("weights_to_adapt"))
             or normalize_optional_value(row.get("target_weights"))
         )
-        expanded["run_name"] = derive_run_name(expanded)
         expanded["ttlora_weight_config"] = normalize_optional_value(row.get("ttlora_weight_config"))
+        row_ttshape_config_root = (
+            normalize_optional_value(row.get("ttshape_config_root"))
+            or normalize_optional_value(row.get("default_ttshape_config_root"))
+        )
+        if row_ttshape_config_root is not None and expanded["ttlora_weight_config"] is None:
+            expanded["ttshape_config_root"] = row_ttshape_config_root
+            expanded["ttshape_config_label"] = (
+                normalize_optional_value(row.get("ttshape_config_label"))
+                or infer_ttshape_config_label(str(row_ttshape_config_root))
+            )
+        expanded["run_name"] = normalize_optional_value(row.get("run_name")) or derive_run_name(expanded)
         if expanded["ttlora_weight_config"] is None:
             expanded["ttshape_config_root"] = (
-                normalize_optional_value(row.get("ttshape_config_root"))
-                or normalize_optional_value(row.get("default_ttshape_config_root"))
+                expanded.get("ttshape_config_root")
                 or args.default_ttshape_config_root
             )
             ttshape_config_root = Path(expanded["ttshape_config_root"]).expanduser().resolve()
