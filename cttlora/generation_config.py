@@ -52,6 +52,7 @@ class GenerationTrainingConfig:
     resume_from_last_epoch: bool = False
     summary_only: bool = False
     batch_size: int = 16
+    max_physical_batch_size: int | None = None
     eval_batch_size: int = 16
     gradient_accumulation_steps: int = 1
     epochs: int = 5

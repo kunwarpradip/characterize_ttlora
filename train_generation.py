@@ -52,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--max-physical-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Maximum GPU microbatch size for Opacus virtual batching. "
+            "When DP is enabled, --batch-size remains the logical private batch size."
+        ),
+    )
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
@@ -229,6 +238,7 @@ def main() -> None:
             resume_from_last_epoch=args.resume_from_last_epoch,
             summary_only=args.summary_only,
             batch_size=args.batch_size,
+            max_physical_batch_size=args.max_physical_batch_size,
             eval_batch_size=args.eval_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             epochs=args.epochs,

@@ -8,6 +8,7 @@ import random
 import re
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -50,8 +51,10 @@ except ImportError:
 
 try:
     from opacus import PrivacyEngine
+    from opacus.utils.batch_memory_manager import BatchMemoryManager
 except ImportError:
     PrivacyEngine = None
+    BatchMemoryManager = None
 
 try:
     from . import opacus_ttlora  # noqa: F401
@@ -148,11 +151,21 @@ def _as_grad_sample_tensor(grad_sample) -> torch.Tensor | None:
     return grad_sample
 
 
+def _optimizer_step_will_be_skipped(optimizer) -> bool:
+    check_skip = getattr(optimizer, "_check_skip_next_step", None)
+    if check_skip is None:
+        return False
+    try:
+        return bool(check_skip(pop_next=False))
+    except TypeError:
+        return False
+
+
 def estimate_dp_step_snr(model, max_grad_norm: float, noise_multiplier: float | None) -> tuple[float, float, float] | None:
     if noise_multiplier is None or noise_multiplier <= 0:
         return None
 
-    grad_samples: list[torch.Tensor] = []
+    param_entries: list[tuple[torch.Tensor | None, torch.Tensor | None]] = []
     sample_norm_sq = None
     trainable_parameter_count = 0
 
@@ -161,25 +174,45 @@ def estimate_dp_step_snr(model, max_grad_norm: float, noise_multiplier: float | 
             continue
         trainable_parameter_count += param.numel()
         grad_sample = _as_grad_sample_tensor(getattr(param, "grad_sample", None))
-        if grad_sample is None:
-            continue
-        flat = grad_sample.reshape(grad_sample.shape[0], -1)
-        current_norm_sq = flat.pow(2).sum(dim=1)
-        sample_norm_sq = current_norm_sq if sample_norm_sq is None else sample_norm_sq + current_norm_sq
-        grad_samples.append(grad_sample)
+        summed_grad = getattr(param, "summed_grad", None)
+        if grad_sample is not None:
+            flat = grad_sample.reshape(grad_sample.shape[0], -1)
+            current_norm_sq = flat.pow(2).sum(dim=1)
+            sample_norm_sq = current_norm_sq if sample_norm_sq is None else sample_norm_sq + current_norm_sq
+        param_entries.append((grad_sample, summed_grad))
 
-    if sample_norm_sq is None or not grad_samples or trainable_parameter_count == 0:
+    if not param_entries or trainable_parameter_count == 0:
         return None
 
-    sample_norm = sample_norm_sq.sqrt()
-    clip_coef = (float(max_grad_norm) / (sample_norm + 1e-6)).clamp(max=1.0)
-    signal_norm_sq = torch.zeros((), device=sample_norm.device)
+    clip_coef = None
+    if sample_norm_sq is not None:
+        sample_norm = sample_norm_sq.sqrt()
+        clip_coef = (float(max_grad_norm) / (sample_norm + 1e-6)).clamp(max=1.0)
 
-    for grad_sample in grad_samples:
-        coef = clip_coef.to(device=grad_sample.device, dtype=grad_sample.dtype)
-        view_shape = (coef.shape[0],) + (1,) * (grad_sample.dim() - 1)
-        clipped_sum = (grad_sample * coef.view(view_shape)).sum(dim=0)
-        signal_norm_sq = signal_norm_sq + clipped_sum.detach().float().pow(2).sum().to(signal_norm_sq.device)
+    signal_norm_sq = None
+    for grad_sample, summed_grad in param_entries:
+        clipped_sum = None
+        if grad_sample is not None and clip_coef is not None:
+            coef = clip_coef.to(device=grad_sample.device, dtype=grad_sample.dtype)
+            view_shape = (coef.shape[0],) + (1,) * (grad_sample.dim() - 1)
+            clipped_sum = (grad_sample * coef.view(view_shape)).sum(dim=0)
+
+        if summed_grad is not None:
+            previous_sum = summed_grad.detach()
+            combined_sum = previous_sum if clipped_sum is None else previous_sum + clipped_sum.to(previous_sum.device)
+        else:
+            combined_sum = clipped_sum
+        if combined_sum is None:
+            continue
+        current_norm_sq = combined_sum.detach().float().pow(2).sum()
+        signal_norm_sq = (
+            current_norm_sq
+            if signal_norm_sq is None
+            else signal_norm_sq + current_norm_sq.to(signal_norm_sq.device)
+        )
+
+    if signal_norm_sq is None:
+        return None
 
     signal_norm = float(signal_norm_sq.sqrt().item())
     noise_norm = float(noise_multiplier) * float(max_grad_norm) * math.sqrt(trainable_parameter_count)
@@ -613,10 +646,13 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         logger.info("CUDA device name: %s", torch.cuda.get_device_name(device))
 
     model.train()
+    if config.training.max_physical_batch_size is not None and config.training.max_physical_batch_size <= 0:
+        raise ValueError("max_physical_batch_size must be a positive integer when provided.")
     if config.training.dp_enabled and config.training.gradient_accumulation_steps != 1:
         raise ValueError(
             "Differential privacy currently requires gradient_accumulation_steps=1 in generation training."
         )
+    use_virtual_batching = config.training.dp_enabled and config.training.max_physical_batch_size is not None
 
     optimizer = AdamW(
         parameter_groups(model, config.training.weight_decay),
@@ -628,6 +664,10 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         if PrivacyEngine is None:
             raise ImportError(
                 "Opacus is not installed in the active environment. Install it in the characterize-ttlora env first."
+            )
+        if use_virtual_batching and BatchMemoryManager is None:
+            raise ImportError(
+                "Opacus BatchMemoryManager is not available, but max_physical_batch_size was provided."
             )
         if config.training.dp_target_epsilon is None and config.training.dp_noise_multiplier is None:
             raise ValueError(
@@ -677,6 +717,18 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
                 "Enabled TT-LoRA Opacus activation cache for %d module(s).",
                 ttlora_cache_modules,
             )
+        if use_virtual_batching:
+            logger.info(
+                "Enabled Opacus virtual batching: logical_batch_size=%d max_physical_batch_size=%d logical_train_batches=%d",
+                config.training.batch_size,
+                config.training.max_physical_batch_size,
+                len(train_loader),
+            )
+    elif config.training.max_physical_batch_size is not None:
+        logger.info(
+            "Ignoring max_physical_batch_size=%d because differential privacy is disabled.",
+            config.training.max_physical_batch_size,
+        )
 
     steps_per_epoch = math.ceil(len(train_loader) / max(1, config.training.gradient_accumulation_steps))
     total_steps = max(1, steps_per_epoch * config.training.epochs)
@@ -736,111 +788,137 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         micro_token_correct = 0
         micro_token_total = 0
 
-        train_iterator = enumerate(train_loader, start=1)
-        if tqdm is not None:
-            train_iterator = enumerate(
-                tqdm(
-                    train_loader,
-                    total=len(train_loader),
-                    desc=f"Epoch {epoch}/{config.training.epochs}",
-                    unit="batch",
-                    leave=False,
-                ),
-                start=1,
+        train_loader_context = (
+            BatchMemoryManager(
+                data_loader=train_loader,
+                max_physical_batch_size=config.training.max_physical_batch_size,
+                optimizer=optimizer,
             )
-
-        for step, batch in train_iterator:
-            batch = {key: value.to(device) for key, value in batch.items()}
-            outputs = model(**batch)
-            loss = outputs.loss / max(1, config.training.gradient_accumulation_steps)
-            loss.backward()
-
-            batch_size = batch["input_ids"].size(0)
-            correct_tokens, token_total = causal_lm_accuracy_counts(outputs.logits.detach(), batch["labels"])
-            running_loss += outputs.loss.item() * batch_size
-            running_examples += batch_size
-            running_token_correct += correct_tokens
-            running_token_total += token_total
-            micro_loss_sum += outputs.loss.item() * batch_size
-            micro_examples += batch_size
-            micro_token_correct += correct_tokens
-            micro_token_total += token_total
-
-            should_step = (
-                step % config.training.gradient_accumulation_steps == 0
-                or step == len(train_loader)
-            )
-            if should_step:
-                grad_norm = compute_grad_norm(model)
-                tt_core_grad_norms = compute_ttlora_core_grad_norms(model)
-                update_named_grad_norm_stats(tt_core_grad_norm_stats, tt_core_grad_norms)
-                grad_norm_max = max(grad_norm_max, grad_norm)
-                grad_norm_min = min(grad_norm_min, grad_norm)
-                clip_threshold = (
-                    config.training.dp_max_grad_norm
-                    if config.training.dp_enabled
-                    else config.training.max_grad_norm
-                )
-                clipping_triggered = grad_norm > clip_threshold
-                if clipping_triggered:
-                    clipped_steps += 1
-                if not config.training.dp_enabled:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
-                dp_step_snr = (
-                    estimate_dp_step_snr(model, config.training.dp_max_grad_norm, dp_noise_multiplier)
-                    if config.training.dp_enabled
-                    else None
-                )
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                grad_norm_sum += grad_norm
-                optimizer_steps += 1
-                global_optimizer_step += 1
-                if dp_step_snr is not None:
-                    step_snr, step_signal_norm, step_noise_norm = dp_step_snr
-                    dp_snr_sum += step_snr
-                    dp_signal_norm_sum += step_signal_norm
-                    dp_noise_norm_sum += step_noise_norm
-                    dp_snr_steps += 1
-                current_lr = (
-                    scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+            if use_virtual_batching
+            else nullcontext(train_loader)
+        )
+        with train_loader_context as epoch_train_loader:
+            epoch_train_batches = len(epoch_train_loader)
+            train_iterator = enumerate(epoch_train_loader, start=1)
+            if tqdm is not None:
+                train_iterator = enumerate(
+                    tqdm(
+                        epoch_train_loader,
+                        total=epoch_train_batches,
+                        desc=f"Epoch {epoch}/{config.training.epochs}",
+                        unit="microbatch" if use_virtual_batching else "batch",
+                        leave=False,
+                    ),
+                    start=1,
                 )
 
-                if optimizer_steps % max(1, config.training.step_metrics_every) == 0:
-                    step_history.append(
-                        GenerationStepRecord(
-                            epoch=epoch,
-                            optimizer_step=global_optimizer_step,
-                            optimizer_step_in_epoch=optimizer_steps,
-                            micro_step_end=step,
-                            train_loss=micro_loss_sum / max(1, micro_examples),
-                            train_token_accuracy=micro_token_correct / max(1, micro_token_total),
-                            grad_norm_pre_clip=grad_norm,
-                            clipping_triggered=clipping_triggered,
-                            learning_rate=current_lr,
-                            examples_seen_epoch=running_examples,
-                            elapsed_seconds=time.time() - start_time,
-                            tt_core_grad_norms_json=(
-                                json.dumps(tt_core_grad_norms, sort_keys=True) if tt_core_grad_norms else None
-                            ),
+            for step, batch in train_iterator:
+                batch = {key: value.to(device) for key, value in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss / max(1, config.training.gradient_accumulation_steps)
+                loss.backward()
+
+                batch_size = batch["input_ids"].size(0)
+                correct_tokens, token_total = causal_lm_accuracy_counts(outputs.logits.detach(), batch["labels"])
+                running_loss += outputs.loss.item() * batch_size
+                running_examples += batch_size
+                running_token_correct += correct_tokens
+                running_token_total += token_total
+                micro_loss_sum += outputs.loss.item() * batch_size
+                micro_examples += batch_size
+                micro_token_correct += correct_tokens
+                micro_token_total += token_total
+
+                should_step = (
+                    step % config.training.gradient_accumulation_steps == 0
+                    or step == epoch_train_batches
+                )
+                if should_step:
+                    step_will_be_skipped = (
+                        config.training.dp_enabled and _optimizer_step_will_be_skipped(optimizer)
+                    )
+                    grad_norm = 0.0
+                    tt_core_grad_norms = {}
+                    clipping_triggered = False
+                    dp_step_snr = None
+                    if not step_will_be_skipped:
+                        grad_norm = compute_grad_norm(model)
+                        tt_core_grad_norms = compute_ttlora_core_grad_norms(model)
+                        update_named_grad_norm_stats(tt_core_grad_norm_stats, tt_core_grad_norms)
+                        grad_norm_max = max(grad_norm_max, grad_norm)
+                        grad_norm_min = min(grad_norm_min, grad_norm)
+                        clip_threshold = (
+                            config.training.dp_max_grad_norm
+                            if config.training.dp_enabled
+                            else config.training.max_grad_norm
                         )
+                        clipping_triggered = grad_norm > clip_threshold
+                        if clipping_triggered:
+                            clipped_steps += 1
+                        if not config.training.dp_enabled:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+                        dp_step_snr = (
+                            estimate_dp_step_snr(model, config.training.dp_max_grad_norm, dp_noise_multiplier)
+                            if config.training.dp_enabled
+                            else None
+                        )
+                    optimizer.step()
+                    step_was_skipped = (
+                        config.training.dp_enabled
+                        and bool(getattr(optimizer, "_is_last_step_skipped", False))
                     )
-                micro_loss_sum = 0.0
-                micro_examples = 0
-                micro_token_correct = 0
-                micro_token_total = 0
+                    if scheduler is not None and not step_was_skipped:
+                        scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    if step_was_skipped:
+                        continue
 
-                if optimizer_steps % max(1, config.training.log_every_steps) == 0:
-                    avg_loss = running_loss / max(1, running_examples)
-                    avg_token_accuracy = running_token_correct / max(1, running_token_total)
-                    logger.info(
-                        f"epoch={epoch} step={optimizer_steps}/{steps_per_epoch} "
-                        f"train_loss={avg_loss:.4f} train_tok_acc={avg_token_accuracy:.4f} grad_norm={grad_norm:.4f} "
-                        f"clipped={clipping_triggered} lr={current_lr:.2e}"
-                        + (f" dp_snr={dp_step_snr[0]:.4f}" if dp_step_snr is not None else "")
+                    grad_norm_sum += grad_norm
+                    optimizer_steps += 1
+                    global_optimizer_step += 1
+                    if dp_step_snr is not None:
+                        step_snr, step_signal_norm, step_noise_norm = dp_step_snr
+                        dp_snr_sum += step_snr
+                        dp_signal_norm_sum += step_signal_norm
+                        dp_noise_norm_sum += step_noise_norm
+                        dp_snr_steps += 1
+                    current_lr = (
+                        scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
                     )
+
+                    if optimizer_steps % max(1, config.training.step_metrics_every) == 0:
+                        step_history.append(
+                            GenerationStepRecord(
+                                epoch=epoch,
+                                optimizer_step=global_optimizer_step,
+                                optimizer_step_in_epoch=optimizer_steps,
+                                micro_step_end=step,
+                                train_loss=micro_loss_sum / max(1, micro_examples),
+                                train_token_accuracy=micro_token_correct / max(1, micro_token_total),
+                                grad_norm_pre_clip=grad_norm,
+                                clipping_triggered=clipping_triggered,
+                                learning_rate=current_lr,
+                                examples_seen_epoch=running_examples,
+                                elapsed_seconds=time.time() - start_time,
+                                tt_core_grad_norms_json=(
+                                    json.dumps(tt_core_grad_norms, sort_keys=True) if tt_core_grad_norms else None
+                                ),
+                            )
+                        )
+                    micro_loss_sum = 0.0
+                    micro_examples = 0
+                    micro_token_correct = 0
+                    micro_token_total = 0
+
+                    if optimizer_steps % max(1, config.training.log_every_steps) == 0:
+                        avg_loss = running_loss / max(1, running_examples)
+                        avg_token_accuracy = running_token_correct / max(1, running_token_total)
+                        logger.info(
+                            f"epoch={epoch} step={optimizer_steps}/{steps_per_epoch} "
+                            f"train_loss={avg_loss:.4f} train_tok_acc={avg_token_accuracy:.4f} "
+                            f"grad_norm={grad_norm:.4f} clipped={clipping_triggered} lr={current_lr:.2e}"
+                            + (f" dp_snr={dp_step_snr[0]:.4f}" if dp_step_snr is not None else "")
+                        )
 
         train_loss = running_loss / max(1, running_examples)
         train_token_accuracy = running_token_correct / max(1, running_token_total)
@@ -1037,6 +1115,7 @@ def run_generation_experiment(config: GenerationExperimentConfig) -> dict:
         "learning_rate": config.training.learning_rate,
         "lr_scheduler": config.training.lr_scheduler,
         "batch_size": config.training.batch_size,
+        "max_physical_batch_size": config.training.max_physical_batch_size,
         "eval_batch_size": config.training.eval_batch_size,
         "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
         "max_grad_norm_threshold": config.training.max_grad_norm,

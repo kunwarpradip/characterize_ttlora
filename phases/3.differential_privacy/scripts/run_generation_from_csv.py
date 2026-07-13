@@ -19,6 +19,7 @@ def add_compact_default_args(parser: argparse.ArgumentParser, project_root: Path
     parser.add_argument("--default-ttlora-variant", default="reconstruction", choices=("contraction", "reconstruction"))
     parser.add_argument("--default-seed", type=int, default=42)
     parser.add_argument("--default-batch-size", type=int, default=32)
+    parser.add_argument("--default-max-physical-batch-size", type=int, default=None)
     parser.add_argument("--default-eval-batch-size", type=int, default=32)
     parser.add_argument("--default-gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--default-max-length", type=int, default=1024)
@@ -247,6 +248,12 @@ def derive_run_name(expanded_row: dict[str, Any]) -> str:
     method = sanitize_name_token(str(expanded_row["adaptation_method"]))
     ttshape_label = sanitize_name_token(str(expanded_row.get("ttshape_config_label") or ""))
     ttshape_segment = f"_{ttshape_label}" if ttshape_label else ""
+    max_physical_batch_size = normalize_optional_value(expanded_row.get("max_physical_batch_size"))
+    batch_segment = (
+        f"_bs{int(expanded_row['batch_size'])}_phys{int(max_physical_batch_size)}"
+        if max_physical_batch_size is not None
+        else ""
+    )
     rank = int(
         expanded_row["ttlora_rank"]
         if expanded_row["adaptation_method"] == "ttlora"
@@ -260,14 +267,14 @@ def derive_run_name(expanded_row: dict[str, Any]) -> str:
             core_count = int(expanded_row["core_count"])
             alpha = expanded_row["ttlora_alpha"]
             variant = sanitize_name_token(str(expanded_row["ttlora_variant"]))
-            return f"{model}_{dataset}_{method}_{variant}{ttshape_segment}_cores{core_count}_rank{rank}_alpha{alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
+            return f"{model}_{dataset}_{method}_{variant}{ttshape_segment}{batch_segment}_cores{core_count}_rank{rank}_alpha{alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
         lora_alpha= expanded_row["lora_alpha"]
-        return f"{model}_{dataset}_{method}_rank{rank}_alpha{lora_alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
+        return f"{model}_{dataset}_{method}{batch_segment}_rank{rank}_alpha{lora_alpha}_eps{eps_token}_lr{lr_token}_seed{seed}"
     if expanded_row["adaptation_method"] == "ttlora":
         core_count = int(expanded_row["core_count"])
         variant = sanitize_name_token(str(expanded_row["ttlora_variant"]))
-        return f"{model}_{dataset}_{method}_{variant}{ttshape_segment}_cores{core_count}_rank{rank}_lr{lr_token}_seed{seed}"
-    return f"{model}_{dataset}_{method}_rank{rank}_lr{lr_token}_seed{seed}"
+        return f"{model}_{dataset}_{method}_{variant}{ttshape_segment}{batch_segment}_cores{core_count}_rank{rank}_lr{lr_token}_seed{seed}"
+    return f"{model}_{dataset}_{method}{batch_segment}_rank{rank}_lr{lr_token}_seed{seed}"
 
 
 def infer_ttshape_config_label(ttshape_config_root: str) -> str:
@@ -309,6 +316,14 @@ def expand_row_defaults(row: dict[str, str], args: argparse.Namespace, project_r
     expanded["max_length"] = normalize_optional_value(row.get("max_length")) or str(args.default_max_length)
     expanded["training_format"] = normalize_optional_value(row.get("training_format")) or args.default_training_format
     expanded["batch_size"] = normalize_optional_value(row.get("batch_size")) or str(args.default_batch_size)
+    expanded["max_physical_batch_size"] = (
+        normalize_optional_value(row.get("max_physical_batch_size"))
+        or (
+            str(args.default_max_physical_batch_size)
+            if args.default_max_physical_batch_size is not None
+            else None
+        )
+    )
     expanded["eval_batch_size"] = normalize_optional_value(row.get("eval_batch_size")) or str(args.default_eval_batch_size)
     expanded["gradient_accumulation_steps"] = (
         normalize_optional_value(row.get("gradient_accumulation_steps")) or str(args.default_gradient_accumulation_steps)
@@ -470,6 +485,7 @@ def build_command(
     add_scalar_arg(command, "--training-format", row.get("training_format"))
 
     add_scalar_arg(command, "--batch-size", row.get("batch_size"))
+    add_scalar_arg(command, "--max-physical-batch-size", row.get("max_physical_batch_size"))
     add_scalar_arg(command, "--eval-batch-size", row.get("eval_batch_size"))
     add_scalar_arg(command, "--gradient-accumulation-steps", row.get("gradient_accumulation_steps"))
     add_scalar_arg(command, "--epochs", row.get("epochs"))
