@@ -23,7 +23,7 @@ from run_generation_from_csv import (
 
 
 def parse_args() -> argparse.Namespace:
-    project_root = Path("/home/pkunwar/characterize_ttlora")
+    project_root = Path("/usr/projects/unsupgan/pkunwar/characterize_ttlora")
     parser = argparse.ArgumentParser(
         description="Submit train_generation.py runs from a CSV file to a Ray cluster."
     )

@@ -39,7 +39,7 @@ def add_compact_default_args(parser: argparse.ArgumentParser, project_root: Path
 
 
 def parse_args() -> argparse.Namespace:
-    project_root = Path("/home/pkunwar/characterize_ttlora")
+    project_root = Path("/usr/projects/unsupgan/pkunwar/characterize_ttlora")
     parser = argparse.ArgumentParser(
         description=(
             "Run train_generation.py from a CSV file, one row per run. "
