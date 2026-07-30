@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttlora"
+version = "0.1.0"
+description = "Tensor-Train LoRA adapters for PyTorch and Hugging Face models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "TT-LoRA contributors" }
+]
+dependencies = [
+  "torch>=2.0"
+]
+
+[project.optional-dependencies]
+transformers = [
+  "transformers>=4.30"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ttlora*"]

@@ -1,0 +1,16 @@
+{
+  "freeze_base_model": true,
+  "init_seed": 42,
+  "strict": true,
+  "targets": [
+    {
+      "module_name_pattern": ".*attn\\.c_attn$",
+      "weight_shape": [2304, 768],
+      "input_factors": [32, 4, 6],
+      "output_factors": [48, 6, 8],
+      "rank": 6,
+      "alpha": 16.0,
+      "variant": "contraction"
+    }
+  ]
+}

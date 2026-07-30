@@ -22,5 +22,8 @@ phases/2.1.ttlora_core_count_study/analysis/parameter*/
 *.csv
 *.json
 !phases/ttshape_selection/examples/*.json
+!huggingface/examples/*.json
 kdd_ttlora.pdf
 *.log
+CORE_COUNT_EXPERIMENT_CODE_SETUP.md
+TT_SHAPE_SELECTION_STRATEGY.md
